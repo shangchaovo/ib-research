@@ -26,21 +26,25 @@ python3 ib_research_fetcher.py          # 完整抓取 + LLM 摘要
 python3 ib_research_fetcher.py --fast   # 快速模式(读 AV 缓存,适合高频 cron)
 python3 ib_research_server.py           # http://localhost:8081
 python3 ib_research_health.py           # 数据新鲜度 / 质量检查
+python3 -m unittest discover -s tests -t . -v
 ```
 
-定时任务参考 `ib_research_cron_runner.py`(带锁、日志、异常告警)。
+定时任务参考 `ib_research_cron_runner.py`（进程锁、日志、异常告警）。
 
 ## 环境变量
 
 | Key | 说明 |
 |-----|------|
-| `FINNHUB_API_KEY` | Finnhub 评级与新闻(必需) |
-| `ALPHA_VANTAGE_API_KEY` | 一致目标价(每日 25 次免费额度,按天缓存) |
+| `FINNHUB_API_KEY` | Finnhub 评级与新闻（必需） |
+| `ALPHA_VANTAGE_API_KEY` | 一致目标价（每日 25 次免费额度，按天缓存） |
 | `TWELVEDATA_API_KEY` / `MARKETDATA_API_KEY` | 行情补充 |
 | `KIMI_API_KEY` | Kimi LLM 摘要 |
-| `LLM_QWEN_API_KEY` | Qwen 兜底(可选) |
-| `IB_RESEARCH_REFRESH_TOKEN` | 保护 `/refresh` 端点(可选) |
-| `IB_RESEARCH_CACHE_DIR` | 数据目录(默认 `./data/ib_research`) |
+| `LLM_QWEN_API_KEY` | Qwen 兜底（可选） |
+| `IB_RESEARCH_REFRESH_TOKEN` | 保护 `/refresh` 端点（可选） |
+| `IB_RESEARCH_CACHE_DIR` | 数据目录（默认 `./data/ib_research`） |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 可选代理；未设置则直连 |
+| `IB_RESEARCH_SSL_VERIFY` | 默认校验证书；设为 `0` 时关闭（仅自签名代理） |
+| `IB_RESEARCH_HOST` / `IB_RESEARCH_PORT` | HTTP 服务绑定（默认 `0.0.0.0:8081`） |
 
 ## 数据来源说明
 

@@ -22,6 +22,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import xml.etree.ElementTree as ET
@@ -30,30 +31,21 @@ import requests
 from email.utils import parsedate_to_datetime
 from urllib3.exceptions import InsecureRequestWarning
 
-# 禁用未验证 HTTPS 请求的警告（本地代理/自签名环境）
-requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
-
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple, Callable
 
 # Qwen fallback（阿里云百炼，国内直连）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from env_loader import load_dotenv, get_proxy, ssl_verify, request_proxy_modes
+
+load_dotenv()
+
 try:
     from llm_fallback import call_qwen as _call_qwen, is_quota_error as _is_quota_error
     _HAS_QWEN = True
 except ImportError:
     _HAS_QWEN = False
-
-# 先加载 .env，再读取环境变量
-env_path = os.environ.get("IB_RESEARCH_ENV", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-if os.path.exists(env_path):
-    with open(env_path, "r", encoding="utf-8") as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if _line and "=" in _line and not _line.startswith("#"):
-                _k, _v = _line.split("=", 1)
-                os.environ.setdefault(_k, _v)
 
 # === 配置 ===
 FINNHUB_TOKEN = os.environ.get("FINNHUB_API_KEY", "")
@@ -83,7 +75,11 @@ IB_RESEARCH_FALLBACK_MODEL = (
     or "openai/gpt-5.5"
 )
 OPENCLAW_NODE_DIR = os.environ.get("OPENCLAW_NODE_DIR", "").strip()
-PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("http_proxy") or "http://127.0.0.1:1082"
+# 仅在显式配置 HTTPS_PROXY/HTTP_PROXY 时走代理；不再默认连本机 1082。
+PROXY = get_proxy()
+SSL_VERIFY = ssl_verify()
+if not SSL_VERIFY:
+    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 CACHE_DIR = os.environ.get("IB_RESEARCH_CACHE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ib_research"))
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -149,25 +145,27 @@ HIGH_PRIORITY_KEYWORDS = ["upgrade", "downgrade", "price target", "reiterat", "i
 
 # === 限流器 ===
 class RateLimiter:
-    """简单令牌桶限流器"""
+    """简单滑动窗口限流器（线程安全，供 Finnhub 并行抓取共用）"""
     def __init__(self, max_calls: int, window_seconds: int):
         self.max_calls = max_calls
         self.window = window_seconds
         self.calls: List[float] = []
+        self._lock = threading.Lock()
 
     def acquire(self):
         """阻塞直到获得一个令牌"""
-        now = time.time()
-        # 清理过期记录
-        cutoff = now - self.window
-        self.calls = [t for t in self.calls if t > cutoff]
-        if len(self.calls) >= self.max_calls:
-            sleep_time = self.calls[0] - cutoff
-            if sleep_time > 0:
-                print(f"     [RateLimit] 等待 {sleep_time:.1f}s...")
-                time.sleep(sleep_time)
-                self.calls = self.calls[1:]
-        self.calls.append(time.time())
+        with self._lock:
+            now = time.time()
+            cutoff = now - self.window
+            self.calls = [t for t in self.calls if t > cutoff]
+            if len(self.calls) >= self.max_calls:
+                sleep_time = self.calls[0] - cutoff
+                if sleep_time > 0:
+                    print(f"     [RateLimit] 等待 {sleep_time:.1f}s...")
+                    time.sleep(sleep_time)
+                    cutoff = time.time() - self.window
+                    self.calls = [t for t in self.calls if t > cutoff]
+            self.calls.append(time.time())
 
 
 # Finnhub 免费版: 60 calls/min
@@ -213,36 +211,40 @@ def _parse_kimi_json(content: str) -> Optional[Dict]:
     except json.JSONDecodeError:
         pass
 
-    # 2. 从文本中定位第一个 JSON 对象（花括号匹配）
+    # 2. 从文本中定位第一个合法 JSON 对象（花括号匹配，跳过无效片段）
     start = content.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for i, ch in enumerate(content[start:], start):
-        if in_string:
-            if escape:
-                escape = False
-                continue
-            if ch == "\\":
-                escape = True
+    while start >= 0:
+        depth = 0
+        in_string = False
+        escape = False
+        end = None
+        for i, ch in enumerate(content[start:], start):
+            if in_string:
+                if escape:
+                    escape = False
+                    continue
+                if ch == "\\":
+                    escape = True
+                    continue
+                if ch == '"':
+                    in_string = False
                 continue
             if ch == '"':
-                in_string = False
-            continue
-        if ch == '"':
-            in_string = True
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(content[start:i + 1])
-                except json.JSONDecodeError:
-                    return None
+                in_string = True
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+        if end is None:
+            return None
+        try:
+            return json.loads(content[start:end + 1])
+        except json.JSONDecodeError:
+            start = content.find("{", start + 1)
     return None
 
 
@@ -261,10 +263,7 @@ def _http_request(
     last_err = None
     for attempt in range(retries):
         mode_err = None
-        for proxies, mode in [
-            ({"http": PROXY, "https": PROXY}, "proxy"),
-            (None, "direct"),
-        ]:
+        for proxies, mode in request_proxy_modes(PROXY):
             resp = None
             session = _http_session if proxies else _direct_http_session
             request_timeout = timeout
@@ -273,11 +272,11 @@ def _http_request(
             try:
                 if method.upper() == "POST":
                     resp = session.post(
-                        url, json=payload, headers=req_headers, proxies=proxies, timeout=request_timeout, verify=False
+                        url, json=payload, headers=req_headers, proxies=proxies, timeout=request_timeout, verify=SSL_VERIFY
                     )
                 else:
                     resp = session.get(
-                        url, headers=req_headers, proxies=proxies, timeout=timeout, verify=False
+                        url, headers=req_headers, proxies=proxies, timeout=timeout, verify=SSL_VERIFY
                     )
                 resp.raise_for_status()
                 return resp.text if as_text else resp.json()
@@ -332,7 +331,7 @@ def _http_post_json_once(
             headers=dict(headers),
             proxies=proxies,
             timeout=timeout,
-            verify=False,
+            verify=SSL_VERIFY,
         )
         response.raise_for_status()
         return response.json()
@@ -526,8 +525,8 @@ def fetch_yahoo_enrichment(symbols: List[str]) -> Dict[str, Dict]:
     return out
 
 
-def _fetch_single_news(sym: str, from_date: str, to_date: str, seen_urls: set) -> List[Dict]:
-    """获取单只股票的新闻（用于并行）"""
+def _fetch_single_news(sym: str, from_date: str, to_date: str) -> List[Dict]:
+    """获取单只股票的新闻（用于并行；去重在汇总阶段完成）"""
     finnhub_limiter.acquire()
     url = (f"https://finnhub.io/api/v1/company-news?symbol={sym}"
            f"&from={from_date}&to={to_date}&token={FINNHUB_TOKEN}")
@@ -546,9 +545,6 @@ def _fetch_single_news(sym: str, from_date: str, to_date: str, seen_urls: set) -
             continue
 
         news_url = news.get("url", "")
-        if news_url and news_url in seen_urls:
-            continue
-        seen_urls.add(news_url)
 
         dt_unix = news.get("datetime", 0)
         time_published = ""
@@ -582,20 +578,28 @@ def fetch_finnhub_news(symbols: List[str]) -> List[Dict]:
     from_date = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
     to_date = datetime.now().strftime("%Y-%m-%d")
     results = []
-    seen_urls = set()
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {
-            executor.submit(_fetch_single_news, sym, from_date, to_date, seen_urls): sym
+            executor.submit(_fetch_single_news, sym, from_date, to_date): sym
             for sym in symbols
         }
         for future in as_completed(futures):
-            local_results = future.result()
-            results.extend(local_results)
+            results.extend(future.result())
 
-    results.sort(key=lambda x: x.get("_relevance", 0), reverse=True)
-    print(f"     Finnhub 新闻补充源: {len(results)} 条匹配")
-    return results
+    deduped = []
+    seen_urls = set()
+    for item in results:
+        news_url = item.get("url") or ""
+        if news_url:
+            if news_url in seen_urls:
+                continue
+            seen_urls.add(news_url)
+        deduped.append(item)
+
+    deduped.sort(key=lambda x: x.get("_relevance", 0), reverse=True)
+    print(f"     Finnhub 新闻补充源: {len(deduped)} 条匹配")
+    return deduped
 
 
 def _rating_relevance_score(title: str, summary: str) -> int:

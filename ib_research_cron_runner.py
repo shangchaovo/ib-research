@@ -8,6 +8,7 @@ kept in a local log; stdout is reserved for the short QQ/cron delivery summary.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import subprocess
@@ -15,7 +16,7 @@ import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, TextIO
 from zoneinfo import ZoneInfo
 
 
@@ -24,6 +25,7 @@ DATA_DIR = WORKSPACE / "data" / "ib_research"
 FETCHER = WORKSPACE / "ib_research_fetcher.py"
 HEALTH_CHECK = WORKSPACE / "ib_research_health.py"
 RUN_LOG = DATA_DIR / "ib_research_cron.log"
+CRON_LOCK = DATA_DIR / ".cron.lock"
 LOCAL_TZ = ZoneInfo("Asia/Shanghai")
 DEFAULT_TIMEOUT_SECONDS = int(os.getenv("IB_RESEARCH_CRON_TIMEOUT_SECONDS", "1500"))
 
@@ -55,6 +57,18 @@ def _timeout_text(value: str | bytes | None) -> str:
     if isinstance(value, bytes):
         return value.decode("utf-8", errors="replace")
     return value or ""
+
+
+def _acquire_cron_lock() -> Optional[TextIO]:
+    """Prevent overlapping cron runs from racing the daily report."""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    handle = CRON_LOCK.open("a+", encoding="utf-8")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        handle.close()
+        return None
+    return handle
 
 
 def _load_today_report(started_at: datetime, require_fresh: bool) -> tuple[dict[str, Any] | None, str | None]:
@@ -145,8 +159,23 @@ def main() -> int:
     args = parser.parse_args()
 
     started_at = datetime.now(LOCAL_TZ)
-    fetch_result: subprocess.CompletedProcess[str] | None = None
     run_id = uuid.uuid4().hex
+    lock_handle = _acquire_cron_lock()
+    if lock_handle is None:
+        print("❌ 外资投行研报更新失败：已有 Cron 任务在运行")
+        return 5
+
+    try:
+        return _run_job(args, started_at, run_id)
+    finally:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            lock_handle.close()
+
+
+def _run_job(args: argparse.Namespace, started_at: datetime, run_id: str) -> int:
+    fetch_result: subprocess.CompletedProcess[str] | None = None
 
     if not args.validate_only:
         fetch_env = os.environ.copy()

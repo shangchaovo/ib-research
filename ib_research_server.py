@@ -29,6 +29,7 @@ from flask import Flask, jsonify, Response, request
 
 # 将workspace加入路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from env_loader import load_dotenv
 from ib_research_fetcher import run_fetch, get_latest_report, CACHE_DIR, FINNHUB_TOKEN
 
 app = Flask(__name__)
@@ -98,14 +99,7 @@ def _add_security_headers(response):
 
 def _load_env():
     """加载环境变量"""
-    env_path = os.environ.get("IB_RESEARCH_ENV", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and "=" in line and not line.startswith("#"):
-                    k, v = line.split("=", 1)
-                    os.environ.setdefault(k, v)
+    load_dotenv()
 
 
 def _is_refresh_authorized_request() -> bool:
@@ -2687,17 +2681,22 @@ def index():
         response.set_etag(hashlib.sha256(html.encode("utf-8")).hexdigest())
         return response.make_conditional(request)
     except Exception as e:
-        return f"<h1>Error</h1><p>{e}</p>", 500
+        return f"<h1>Error</h1><p>{escape(str(e))}</p>", 500
 
 
 if __name__ == "__main__":
     _load_env()
+    host = os.environ.get("IB_RESEARCH_HOST", "0.0.0.0").strip() or "0.0.0.0"
+    try:
+        port = int(os.environ.get("IB_RESEARCH_PORT", "8081"))
+    except ValueError:
+        port = 8081
     print("=" * 60)
     print("外资投行研报总结服务")
     print("=" * 60)
     print("端点:")
-    print("  http://localhost:8080/                -> HTML报告")
-    print("  http://localhost:8080/api/ib-research -> JSON API")
-    print("  POST http://localhost:8080/api/ib-research/refresh -> 手动刷新")
+    print(f"  http://127.0.0.1:{port}/                -> HTML报告")
+    print(f"  http://127.0.0.1:{port}/api/ib-research -> JSON API")
+    print(f"  POST http://127.0.0.1:{port}/api/ib-research/refresh -> 手动刷新")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=8081, debug=False)
+    app.run(host=host, port=port, debug=False)

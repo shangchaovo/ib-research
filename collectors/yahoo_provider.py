@@ -1,10 +1,10 @@
 """Yahoo Finance 共享数据层（yfinance 封装）。
 
 提供美股行情、新闻、基本面、财报日历、分析师评级。
-带代理配置 + TTL 内存缓存 + 失败静默降级，供 collector / monitor 复用。
+TTL 内存缓存 + 失败静默降级；代理沿用进程已有的 HTTPS_PROXY/HTTP_PROXY。
 
 用法：
-    from scripts.collectors.yahoo_provider import YahooProvider
+    from collectors.yahoo_provider import YahooProvider
     yp = YahooProvider()
     quote = yp.quote("AAPL")            # {price, change_pct, ...}
     news = yp.news("AAPL", limit=5)     # [{title, publisher, link, published}, ...]
@@ -14,29 +14,20 @@
 """
 from __future__ import annotations
 
-import os
 import time
 from datetime import datetime
 from typing import Any, Optional
 
 import pandas as pd
 
-PROXY = "http://127.0.0.1:1082"
-
 
 def _safe_float(v) -> Optional[float]:
     try:
-        import pandas as pd
         if v is None or (isinstance(v, float) and v != v) or pd.isna(v):
             return None
         return float(v)
     except Exception:
         return None
-
-
-def _setup_proxy():
-    os.environ.setdefault("HTTP_PROXY", PROXY)
-    os.environ.setdefault("HTTPS_PROXY", PROXY)
 
 
 class _TTLCache:
@@ -64,7 +55,6 @@ class YahooProvider:
     TTL_RECS = 21600       # 6 h
 
     def __init__(self):
-        _setup_proxy()
         self._cache = _TTLCache()
         self._tickers: dict[str, Any] = {}
 
