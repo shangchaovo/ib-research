@@ -34,6 +34,10 @@ import threading
 import urllib.request
 import urllib.error
 
+from env_loader import load_dotenv
+
+load_dotenv()
+
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
@@ -76,13 +80,6 @@ def load_qwen_api_key() -> str:
     return ""
 
 SKIP_KIMI = os.environ.get("LLM_SKIP_KIMI", "").strip() in ("1", "true", "yes")
-
-# 默认代理（温州网络）
-DEFAULT_PROXY = "http://127.0.0.1:1082"
-
-# Kimi 需要代理；Qwen（OpenCode Go 端点）也需要代理
-_KIMI_NEEDS_PROXY = True
-_QWEN_NEEDS_PROXY = True
 
 
 def _log(msg: str):
@@ -162,10 +159,12 @@ class LLMAllProvidersError(RuntimeError):
 # ---------------------------------------------------------------------------
 
 def _get_proxy():
+    """Only use a proxy when one is explicitly configured."""
     return (
         os.environ.get("HTTPS_PROXY", "").strip()
         or os.environ.get("https_proxy", "").strip()
-        or DEFAULT_PROXY
+        or os.environ.get("HTTP_PROXY", "").strip()
+        or os.environ.get("http_proxy", "").strip()
     )
 
 
@@ -253,7 +252,7 @@ def call_kimi(messages, max_tokens=4096, temperature=0.5, model=None,
         json.dumps(body).encode("utf-8"),
         headers,
         timeout=timeout,
-        use_proxy=_KIMI_NEEDS_PROXY,
+        use_proxy=bool(_get_proxy()),
     )
     text = _extract_kimi_text(data)
     return text, "kimi"
@@ -294,7 +293,7 @@ def call_qwen(messages, max_tokens=4096, temperature=0.5, model=None,
         json.dumps(body).encode("utf-8"),
         headers,
         timeout=timeout,
-        use_proxy=_QWEN_NEEDS_PROXY,
+        use_proxy=bool(_get_proxy()),
     )
 
     choices = data.get("choices", [])

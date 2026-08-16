@@ -14,7 +14,8 @@ import json
 import os
 import sys
 import urllib.request
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
+from typing import Optional
 
 CACHE_DIR = os.environ.get("IB_RESEARCH_CACHE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ib_research"))
 
@@ -38,7 +39,7 @@ def _load_recent_reports(days: int = 7, files: list = None) -> list:
     return reports
 
 
-def _extract_latest_news_date(raw: dict) -> datetime.date:
+def _extract_latest_news_date(raw: dict) -> Optional[date]:
     """从 raw news 中提取最新一条的日期"""
     latest = None
     for n in raw.get("news", []):
@@ -51,6 +52,14 @@ def _extract_latest_news_date(raw: dict) -> datetime.date:
             except ValueError:
                 continue
     return latest
+
+
+def _aware_generated_at(generated_at: str) -> datetime:
+    """Parse report timestamps. Naive values are local time, not UTC."""
+    dt = datetime.fromisoformat(generated_at)
+    if dt.tzinfo is None:
+        return dt.astimezone()
+    return dt.astimezone(timezone.utc)
 
 
 def check():
@@ -86,10 +95,8 @@ def check():
     generated_at = meta.get("generated_at", "")
     if generated_at:
         try:
-            dt = datetime.fromisoformat(generated_at)
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            age_hours = (datetime.now(timezone.utc) - dt).total_seconds() / 3600
+            dt = _aware_generated_at(generated_at)
+            age_hours = (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600
             if age_hours > 48:
                 issues.append(f"数据已过期 {age_hours:.0f} 小时")
             elif age_hours > 24:
@@ -262,17 +269,21 @@ def check():
     if repeated:
         print(f"    [INFO] 发现 {len(repeated)} 组跨天重复评级变化 (同一事件在 3+ 天出现，属于正常持续信号)")
 
-    # 8. 8081 服务连通性检查（仅警告，不阻断）
+    # 8. 服务连通性检查（仅警告，不阻断）
+    health_url = os.environ.get(
+        "IB_RESEARCH_HEALTH_URL",
+        f"http://127.0.0.1:{os.environ.get('IB_RESEARCH_PORT', '8081')}/api/ib-research",
+    )
     try:
         req = urllib.request.Request(
-            "http://localhost:8081/api/ib-research",
+            health_url,
             headers={"User-Agent": "ib-research-health/1.0"},
         )
         with urllib.request.urlopen(req, timeout=5) as resp:
             if resp.status != 200:
                 print(f"    [WARN] IB Research 服务状态异常: HTTP {resp.status}")
     except Exception as e:
-        print(f"    [WARN] IB Research 服务 (localhost:8081) 不可达: {e}")
+        print(f"    [WARN] IB Research 服务 ({health_url}) 不可达: {e}")
 
     return len(issues) == 0, issues
 
