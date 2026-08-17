@@ -29,7 +29,13 @@ from flask import Flask, jsonify, Response, request
 
 # 将workspace加入路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ib_research_fetcher import run_fetch, get_latest_report, CACHE_DIR, FINNHUB_TOKEN
+from ib_research_fetcher import run_fetch, get_latest_report, CACHE_DIR, FINNHUB_TOKEN, HOT_SYMBOLS
+from ib_research_geo import (
+    homepage_footer_nav_html,
+    homepage_head_html,
+    homepage_nav_html,
+    register_geo_routes,
+)
 
 app = Flask(__name__)
 
@@ -75,7 +81,10 @@ def _add_security_headers(response):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     response.headers.setdefault("X-Frame-Options", "DENY")
-    if response.mimetype == "text/html":
+    path = request.path or ""
+    is_api = path.startswith("/api/")
+    is_html = response.mimetype == "text/html"
+    if is_html:
         response.headers.setdefault(
             "Content-Security-Policy",
             "default-src 'self'; "
@@ -85,15 +94,30 @@ def _add_security_headers(response):
             "img-src 'self' data:; "
             "connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
         )
+    if is_api:
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Robots-Tag"] = "noindex, nofollow"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    elif is_html and response.status_code == 200:
         response.headers.setdefault(
             "Cache-Control",
-            "no-store, no-cache, must-revalidate, max-age=0",
+            "public, max-age=120, s-maxage=300, stale-while-revalidate=1800",
         )
-        response.headers.setdefault("Pragma", "no-cache")
-        response.headers.setdefault("Expires", "0")
-    if request.path.startswith("/api/"):
-        response.headers.setdefault("Cache-Control", "no-store")
+        response.headers.setdefault(
+            "X-Robots-Tag",
+            "index, follow, max-image-preview:large, max-snippet:-1",
+        )
+    elif is_html:
+        response.headers.setdefault("X-Robots-Tag", "noindex")
     return response
+
+
+def _stock_href(symbol: str) -> str:
+    ticker = str(symbol or "").strip().upper()
+    if ticker in HOT_SYMBOLS:
+        return f"/stocks/{ticker.lower()}/"
+    return ""
 
 
 def _load_env():
@@ -678,7 +702,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 {source_badge}
             </div>
             <div class="asset-header">
-                <span class="asset-ticker">{_safe_text(asset)}</span>
+                {f'<a class="asset-ticker" href="{_safe_attr(_stock_href(asset))}">{_safe_text(asset)}</a>' if _stock_href(asset) else f'<span class="asset-ticker">{_safe_text(asset)}</span>'}
                 <span class="asset-target">{_safe_text(target)}</span>
             </div>
             {distribution_html}
@@ -772,9 +796,15 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     # 资产覆盖标签
     assets_html = ""
     if assets_covered:
-        assets_html = "".join(
-            f'<span class="asset-chip">{_safe_text(a)}</span>' for a in assets_covered
-        )
+        chip_bits = []
+        for a in assets_covered:
+            href = _stock_href(a)
+            label = _safe_text(a)
+            if href:
+                chip_bits.append(f'<a class="asset-chip" href="{_safe_attr(href)}">{label}</a>')
+            else:
+                chip_bits.append(f'<span class="asset-chip">{label}</span>')
+        assets_html = "".join(chip_bits)
 
     # 评级变动表格
     changes.sort(
@@ -806,7 +836,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 <td>
                     <div class="symbol-cell">
                         {_logo_html(symbol, size='row')}
-                        <span class="symbol">{_safe_text(symbol)}</span>
+                        {f'<a class="symbol" href="{_safe_attr(_stock_href(symbol))}">{_safe_text(symbol)}</a>' if _stock_href(symbol) else f'<span class="symbol">{_safe_text(symbol)}</span>'}
                     </div>
                 </td>
                 <td>{_safe_text(bank)}{_bank_badge(bank)}</td>
@@ -917,15 +947,17 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         if analysis_text else ""
     )
 
+    stock_strip = "".join(
+        f'<a class="asset-chip" href="/stocks/{ticker.lower()}/">{_safe_text(ticker)}</a>'
+        for ticker in HOT_SYMBOLS
+    )
+    seo_head_html = homepage_head_html(date_range, generated_at)
+
     html = f"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=2" />
+{seo_head_html}
     <link rel="shortcut icon" href="/favicon.ico?v=2" />
-    <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2" />
-    <title>外资投行研报 · {safe_date_range}</title>
     <style>
             :root {{
                 --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
@@ -1125,6 +1157,56 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 padding-bottom: 24px;
                 margin-bottom: 32px;
                 border-bottom: 1px solid var(--border);
+            }}
+            .site-nav {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px 16px;
+                align-items: center;
+                margin-bottom: 18px;
+            }}
+            .site-nav .brand {{
+                font-family: var(--font-serif);
+                font-size: 20px;
+                color: var(--text);
+                margin-right: 8px;
+                text-decoration: none;
+            }}
+            .site-nav a {{
+                color: var(--text-secondary);
+                font-size: 13px;
+                text-decoration: none;
+            }}
+            .site-nav a:hover,
+            .site-nav a[aria-current="page"] {{
+                color: var(--gold);
+            }}
+            a.asset-chip,
+            a.asset-ticker,
+            a.symbol {{
+                color: inherit;
+                text-decoration: none;
+            }}
+            a.asset-chip:hover,
+            a.asset-ticker:hover,
+            a.symbol:hover {{
+                color: var(--gold);
+            }}
+            .footer-nav {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px 16px;
+                margin-top: 28px;
+                padding-top: 16px;
+                border-top: 1px solid var(--border);
+                font-size: 13px;
+            }}
+            .footer-nav a {{ color: var(--text-secondary); }}
+            .stock-strip {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-top: 16px;
             }}
             .edition {{
                 font-family: "JetBrains Mono", monospace;
@@ -2160,6 +2242,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
 </head>
 <body>
     <div class="wrap">
+        {homepage_nav_html()}
         <header class="topbar reveal">
             <div class="edition">Foreign Investment Bank Research · {safe_date_range}</div>
             <div class="refresh-controls">
@@ -2184,12 +2267,15 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
 
         <section class="hero reveal reveal-delay-1">
             <div>
-                <h1 class="hero-title serif">外资投行<em>研报</em><br>深度分析</h1>
+                <h1 class="hero-title serif">AI 金融<em>研究</em>平台</h1>
                 <p class="hero-sub">
-                    覆盖 {len(coverage_banks)} 家主要外资投行、经纪商与权威独立研究机构，排除中国本土投行。
-                    由内部聚合分析引擎基于 {len(meta.get('data_sources', []))} 个数据源进行结构化摘要。
+                    FResearch 追踪外资投行对 AI 算力、半导体与数据中心主线的评级、目标价与研报变动。
+                    覆盖 {len(coverage_banks)} 家主要外资机构，排除中国本土投行；
+                    由内部聚合分析引擎基于 {len(meta.get('data_sources', []))} 个数据源做结构化摘要。
+                    每只关注股票、每个主题和每条研究方法都有独立可索引 URL。
                 </p>
                 {f'<div class="bank-strip">{bank_bubbles}</div>' if bank_bubbles else ''}
+                <div class="stock-strip" aria-label="关注股票">{stock_strip}</div>
             </div>
             <div class="meta-grid">
                 <div class="meta-item">
@@ -2354,6 +2440,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 Fresearch is a research and information software platform. We do not provide investment advisory, brokerage, asset management, or trade execution services. Information provided by the platform is for research and educational purposes only and does not constitute investment advice.
             </div>
         </div>
+        {homepage_footer_nav_html()}
     </div>
 
     <style>
@@ -2676,18 +2763,22 @@ def index():
     """HTML报告页面"""
     try:
         report = get_latest_report()
-        html = _generate_html(report, can_refresh=_is_refresh_authorized_request())
+        can_refresh = _is_refresh_authorized_request()
+        html = _generate_html(report, can_refresh=can_refresh)
         response = Response(html, mimetype="text/html")
-        if request.headers.get("CF-Connecting-IP"):
+        if can_refresh:
+            response.headers["Cache-Control"] = "no-store"
+        else:
             response.headers["Cache-Control"] = (
                 "public, max-age=60, s-maxage=300, stale-while-revalidate=600"
             )
-        else:
-            response.headers["Cache-Control"] = "no-store"
         response.set_etag(hashlib.sha256(html.encode("utf-8")).hexdigest())
         return response.make_conditional(request)
     except Exception as e:
         return f"<h1>Error</h1><p>{e}</p>", 500
+
+
+register_geo_routes(app)
 
 
 if __name__ == "__main__":
@@ -2696,8 +2787,11 @@ if __name__ == "__main__":
     print("外资投行研报总结服务")
     print("=" * 60)
     print("端点:")
-    print("  http://localhost:8080/                -> HTML报告")
-    print("  http://localhost:8080/api/ib-research -> JSON API")
-    print("  POST http://localhost:8080/api/ib-research/refresh -> 手动刷新")
+    print("  http://localhost:8081/                -> HTML报告")
+    print("  http://localhost:8081/robots.txt      -> robots")
+    print("  http://localhost:8081/sitemap.xml     -> sitemap")
+    print("  http://localhost:8081/stocks/nvda/    -> 个股研究页")
+    print("  http://localhost:8081/api/ib-research -> JSON API")
+    print("  POST http://localhost:8081/api/ib-research/refresh -> 手动刷新")
     print("=" * 60)
     app.run(host="0.0.0.0", port=8081, debug=False)

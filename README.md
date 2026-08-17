@@ -11,7 +11,30 @@
 - **三层可信度**:目标价按 `av_consensus`(Alpha Vantage 一致预期)> `verified_headline`(标题正则提取,无 LLM)> `llm_inferred`(Kimi 提取且通过交叉验证)分级展示,不把未验证的 LLM 数字当事实
 - **LLM 摘要**:Kimi(`kimi-code`,JSON mode)生成结构化核心观点,Qwen(阿里云百炼)自动兜底
 - **评级回填**:Yahoo `from_grade→to_grade` 精确回填缺失的 OLD/NEW 评级与目标价;摘要正则从新闻正文补提取模糊标题的目标价
-- **API + 页面**:`ib_research_server.py` 提供 JSON API 与内置研报页面
+- **API + 页面**:`ib_research_server.py` 提供 JSON API、首页研报、股票/主题/知识公开页、`robots.txt` 与 `sitemap.xml`
+
+## SEO / GEO
+
+技术底座已经按“能抓取 → 能索引 → 能引用”接好，不依赖单独的 GEO 黑科技：
+
+| 入口 | 作用 |
+| --- | --- |
+| `/robots.txt` | 允许 Googlebot / OAI-SearchBot；禁止 `/api/`；默认 Disallow `GPTBot` 训练抓取 |
+| `/sitemap.xml` | 首页、关注池股票页、主题、知识库、对比页与信任页 |
+| `/llms.txt` | 可选实验，给生成式系统看的站点说明书；**不是** Google AI Overviews 的前置条件 |
+| `/stocks/nvda/` 等 | 关注池内每只股票的独立 URL，带 Title / H1 / JSON-LD |
+| `/topics/` `/learn/` `/compare/` | 手写主题、金融知识和对照页，不批量生成空壳 |
+| `/about/` `/methodology/` `/sources/` `/disclosures/` | 品牌实体、方法、来源与 YMYL 披露 |
+
+上线后请立刻：
+
+1. 在 [Google Search Console](https://search.google.com/search-console) 添加 `https://fresearch.cc.cd/`，用 URL Inspection 测首页是否 `URL is available to Google`
+2. 提交 `https://fresearch.cc.cd/sitemap.xml`
+3. 若前面仍有 Cloudflare Bot Fight / JS Challenge / WAF，把 Googlebot 与 OAI-SearchBot 放行；否则 Search 与 ChatGPT Search 都会超时
+4. 用 `IB_RESEARCH_PUBLIC_ORIGIN` 指定对外 canonical 域名（默认 `https://fresearch.cc.cd`）
+
+Google 当前对 AI Overviews / AI Mode 的指导仍是：先把传统 SEO 做好（可抓取、独特内容、清晰结构），不需要 `llms.txt` 或特殊 AI markup。
+
 
 ## 关注池
 
@@ -26,6 +49,7 @@ python3 ib_research_fetcher.py          # 完整抓取 + LLM 摘要
 python3 ib_research_fetcher.py --fast   # 快速模式(读 AV 缓存,适合高频 cron)
 python3 ib_research_server.py           # http://localhost:8081
 python3 ib_research_health.py           # 数据新鲜度 / 质量检查
+python3 -m unittest test_ib_research_geo.py
 ```
 
 定时任务参考 `ib_research_cron_runner.py`(带锁、日志、异常告警)。
@@ -41,6 +65,7 @@ python3 ib_research_health.py           # 数据新鲜度 / 质量检查
 | `LLM_QWEN_API_KEY` | Qwen 兜底(可选) |
 | `IB_RESEARCH_REFRESH_TOKEN` | 保护 `/refresh` 端点(可选) |
 | `IB_RESEARCH_CACHE_DIR` | 数据目录(默认 `./data/ib_research`) |
+| `IB_RESEARCH_PUBLIC_ORIGIN` | 对外 canonical 域名(默认 `https://fresearch.cc.cd`) |
 
 ## 数据来源说明
 
