@@ -599,6 +599,23 @@ def favicon_png():
     return _static_asset_response(_site_icon_png, "image/png")
 
 
+_og_image_cache: "bytes | None" = None
+
+
+@app.route("/og-image.png")
+def og_image_png():
+    """OG 分享预览图(scripts/make_og_image.py 生成, 随 deploy 下发)。"""
+    global _og_image_cache
+    if _og_image_cache is None:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "og-image.png")
+        try:
+            with open(path, "rb") as f:
+                _og_image_cache = f.read()
+        except OSError:
+            return Response("not found", status=404, mimetype="text/plain")
+    return _static_asset_response(_og_image_cache, "image/png")
+
+
 @app.route("/assets/logos/<path:symbol>.svg")
 def logo_asset(symbol: str):
     """让浏览器只访问本站；Cloudflare 可缓存所有 logo 和占位图。"""

@@ -4,3 +4,4 @@ __pycache__/
 .DS_Store
 data/
 *.log
+seo_monitor_state.json

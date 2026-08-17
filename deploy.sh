@@ -19,8 +19,10 @@ FILES=(
   ib_research_geo.py
   ib_research_health.py
   ib_research_cron_runner.py
+  ib_research_seo_monitor.py
   llm_fallback.py
   test_ib_research_geo.py
+  og-image.png
 )
 
 echo "==> 部署 ib-research: $SRC -> $DST"
@@ -37,12 +39,19 @@ echo "==> geo 单测"
 
 echo "==> 重启 com.openclaw.ib-research-server"
 launchctl kickstart -k "gui/$(id -u)/com.openclaw.ib-research-server"
-sleep 7
 
-echo "==> 冒烟: 首页 GSC 验证 meta"
-if curl -s --max-time 15 http://127.0.0.1:8081/ | grep -q 'google-site-verification'; then
+echo "==> 冒烟: 等待 8081 就绪并检查 GSC 验证 meta"
+ok=""
+for _ in $(seq 1 20); do
+  if curl -s --max-time 5 http://127.0.0.1:8081/ | grep -q 'google-site-verification'; then
+    ok=1
+    break
+  fi
+  sleep 1
+done
+if [ -n "$ok" ]; then
   echo "    OK: 8081 首页已带验证 meta"
 else
-  echo "    WARN: 未在 8081 首页发现验证 meta,请查日志" >&2
+  echo "    WARN: 20s 内未在 8081 首页发现验证 meta,请查日志" >&2
 fi
 echo "==> 完成"

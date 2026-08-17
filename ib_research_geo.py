@@ -453,6 +453,63 @@ LEARN_PAGES: dict[str, dict] = {
              "我们不会在每个股票页编造毛利率预测。若研报标题或摘要提到 margin，会作为定性上下文出现；定量仍以可验证来源为准。"),
         ],
     },
+    "capex": {
+        "slug": "capex",
+        "title": "资本开支 Capex 是什么？",
+        "h1": "资本开支（Capex）是什么？",
+        "description": "资本开支是公司投向厂房、设备、数据中心等长期资产的钱。AI 行情里，超大规模云厂商的 capex 指引是整条算力链最先被交易的变量。",
+        "one_liner": "Capex = 公司购建长期资产的支出，AI 时代主要指数据中心、GPU 与电力。",
+        "related_learn": ["free-cash-flow", "gross-margin", "price-target"],
+        "related_stocks": ["MSFT", "GOOGL", "AMZN", "META", "NVDA", "VRT"],
+        "sections": [
+            ("直接答案",
+             "资本开支（Capital Expenditure）是公司花在长期资产上的钱：盖厂、买设备、建数据中心。它不一次计入当期成本，而是分年折旧。和自由现金流的关系是：FCF ≈ 经营现金流 − Capex。"),
+            ("为什么 AI 股盯 capex 指引",
+             "微软、谷歌、亚马逊、Meta 每个季度给出的资本开支指引，决定了下游 NVIDIA 的订单、Arista/Broadcom 的网络需求、Vertiv 的电力与冷却订单。指引上调，整条链的目标价往往跟着动；指引放缓，先跌的也常常是同一批股票。"),
+            ("capex 不是越高越好",
+             "市场担心的是“投了但收不回”：如果 capex 高速增长而云收入转化跟不上，研报会开始质疑回报率（ROI），相关公司估值承压。所以读研报要同时看 capex 增速和收入转化，而不是只看绝对额。"),
+            ("FResearch 怎么用",
+             "我们把 capex 相关讨论当作需求侧信号。当外资研报因 capex 指引调整而集中上调/下调算力链目标价时，这些事件会按公司归集到各自股票页，帮助你看到“谁在交易 capex 见顶/见底”。"),
+        ],
+    },
+    "earnings-revision": {
+        "slug": "earnings-revision",
+        "title": "盈利预期修正 Earnings Revision 是什么？",
+        "h1": "盈利预期修正（Earnings Revision）是什么？",
+        "description": "盈利预期修正是分析师上调或下调未来盈利预测的行为。它比单次评级动作更能解释股价的中期方向。",
+        "one_liner": "Earnings Revision = 分析师上调/下调未来盈利预测，方向比一次评级动作更能驱动股价。",
+        "related_learn": ["forward-pe", "analyst-rating", "price-target"],
+        "related_stocks": ["NVDA", "AVGO", "MU", "TSM"],
+        "sections": [
+            ("直接答案",
+             "每家投行都会对覆盖公司做未来几年的盈利模型。当新信息（财报、订单、capex 指引）出现，分析师会调高或调低这些预测，这就是盈利预期修正。Forward PE 的分母正是这些预期。"),
+            ("为什么比评级更关键",
+             "“维持买入但上调盈利预测”往往比“上调评级但不动模型”更能推高股价——因为目标价 = 预期盈利 × 目标倍数，真正变化的是分子。外资研报里 PTS（盈利超预期）和预期上修常同时出现。"),
+            ("怎么识别方向",
+             "同一季度内，若多家投行对同一家公司连续上修，通常意味着基本面超预期在被确认；若只有一家孤立上修，则置信度低。AI 半导体公司因为盈利基数快速变化，预期修正的幅度和频率都高于传统行业。"),
+            ("FResearch 怎么用",
+             "我们把评级与目标价变动按公司和日期归集。当某只股票在 30 天内被多家外资集中上调，你能在它的股票页看到这条“修正簇”，而不是只看到孤立的某一条新闻。"),
+        ],
+    },
+    "buyback": {
+        "slug": "buyback",
+        "title": "股票回购 Buyback 是什么？",
+        "h1": "股票回购（Buyback）是什么？",
+        "description": "股票回购是公司用现金买回自家股票，减少流通股数从而提升每股指标。它是现金充裕的大科技公司回报股东的主要方式之一。",
+        "one_liner": "Buyback = 公司用钱买回自家股票，流通股减少，EPS 等每股指标被动提升。",
+        "related_learn": ["free-cash-flow", "pe-ratio", "capex"],
+        "related_stocks": ["AAPL", "MSFT", "GOOGL", "META"],
+        "sections": [
+            ("直接答案",
+             "回购（Share Buyback）是公司在二级市场买回自己的股票并注销或库存。流通股变少后，即使总利润不变，每股收益（EPS）也会上升。它和分红一样，都是把现金返还给股东的方式。"),
+            ("回购什么时候是加分项",
+             "当公司现金充裕、股价被低估时，回购是高效的资本配置；当公司靠借钱在高位回购，则可能损害长期价值。外资研报会评价回购的“价格是否划算”，而不只是回购的规模。"),
+            ("和成长投入的平衡",
+             "对 AI 公司，市场会同时看回购和 capex：一家公司若一边大额回购、一边又需要巨额 capex 投入数据中心，研报会分析其现金流能否两者兼顾。这是判断财务健康度的关键角度。"),
+            ("FResearch 怎么用",
+             "回购本身不是评级事件，但当外资研报把“回购 + 现金流”作为上调目标价的理由时，会出现在对应股票的评级与目标价变动里。我们把它作为定性上下文呈现，不单独编造回购数据。"),
+        ],
+    },
 }
 
 COMPARE_PAIRS: list[tuple[str, str]] = [
@@ -600,6 +657,7 @@ def seo_head(
     include_style: bool = True,
 ) -> str:
     canonical = _abs(canonical_path)
+    og_image = _abs("/og-image.png")
     robots = "index,follow,max-image-preview:large,max-snippet:-1"
     og_title = _safe_attr(title)
     og_desc = _safe_attr(description)
@@ -624,9 +682,14 @@ def seo_head(
 <meta property="og:description" content="{og_desc}">
 <meta property="og:url" content="{_safe_attr(canonical)}">
 <meta property="og:locale" content="zh_CN">
-<meta name="twitter:card" content="summary">
+<meta property="og:image" content="{_safe_attr(og_image)}">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:type" content="image/png">
+<meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="{og_title}">
 <meta name="twitter:description" content="{og_desc}">
+<meta name="twitter:image" content="{_safe_attr(og_image)}">
 {modified_tag}
 {"".join(_json_ld(item) for item in schemas)}
 {f"<style>{_GEO_CSS}</style>" if include_style else ""}
@@ -726,6 +789,35 @@ def article_schema(headline: str, description: str, path: str, date_modified: st
         "publisher": organization_schema(),
         "mainEntityOfPage": _abs(path),
     }
+
+
+def _faq_schema(page: dict) -> Optional[dict]:
+    """把页面里的"疑问式"内容转成 FAQPage 结构化数据,提高被精选摘要/AI 引用概率。
+
+    取 h1(知识页多为疑问句, 如"市盈率(PE)是什么?")配 one_liner 作为首条问答,
+    再加上 sections 里以"？"结尾的小节。少于 2 条有效问答则不出 schema。
+    """
+    qa: list[dict] = []
+
+    def _add(question: str, answer: str) -> None:
+        q = str(question).strip().rstrip("？?")
+        a = str(answer).strip()
+        if q and a:
+            qa.append({
+                "@type": "Question",
+                "name": q,
+                "acceptedAnswer": {"@type": "Answer", "text": a},
+            })
+
+    h1 = str(page.get("h1", "")).strip()
+    if h1.endswith(("？", "?")):
+        _add(h1, page.get("one_liner", ""))
+    for heading, text in page.get("sections", []):
+        if str(heading).strip().endswith(("？", "?")):
+            _add(heading, text)
+    if not qa:
+        return None
+    return {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": qa[:6]}
 
 
 def homepage_head_html(date_range: str = "", generated_at: str = "") -> str:
@@ -1072,6 +1164,9 @@ def render_topic_page(slug: str) -> str:
         crumb_schema,
         organization_schema(),
     ]
+    faq = _faq_schema(page)
+    if faq:
+        schemas.append(faq)
     return render_page(page["title"] + " | FResearch", page["description"], path, body, schemas, "/topics/")
 
 
@@ -1133,6 +1228,9 @@ def render_learn_page(slug: str) -> str:
         crumb_schema,
         organization_schema(),
     ]
+    faq = _faq_schema(page)
+    if faq:
+        schemas.append(faq)
     return render_page(page["title"] + " | FResearch", page["description"], path, body, schemas, "/learn/")
 
 
