@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 外资投行研报总结服务
-运行在 localhost:8081
+默认绑定 127.0.0.1:8081（可用 IB_RESEARCH_BIND_HOST 覆盖）；
+公网访问经 Cloudflare 隧道 fresearch-dashboard 转发到本机，不直接监听公网网卡。
 
 端点:
   GET /api/ib-research       -> JSON格式的研报总结
   GET /api/ib-research/raw   -> 原始数据
-  POST /api/ib-research/refresh -> 手动刷新
+  POST /api/ib-research/refresh -> 手动刷新（需 X-Refresh-Token，见 .env）
   GET /                        -> HTML报告页面
 """
 import base64
@@ -18,6 +19,8 @@ import os
 import re
 import sys
 import threading
+import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from html import escape
@@ -38,6 +41,8 @@ from ib_research_geo import (
 )
 
 app = Flask(__name__)
+# 本服务不接收请求体，显式限制防止异常大请求
+app.config["MAX_CONTENT_LENGTH"] = 64 * 1024
 
 # 全局锁，防止并发刷新
 _refresh_lock = threading.Lock()
@@ -66,6 +71,140 @@ _logo_download_hosts = {
     "www.spacex.com",
     "voyagertechnologies.com",
 }
+_logo_pending_max = 256  # 待抓取队列上限，防止被随机 symbol 刷爆内存
+
+# —— 页面/数据缓存：以报告文件 mtime 为键，报告更新即自动失效 ——
+_page_cache_lock = threading.Lock()
+_page_cache: dict = {}
+
+# —— 历史目标价查找缓存（随页面缓存一同失效）——
+_hist_pt_cache: dict = {}
+
+# —— 轻量滑动窗口限速器（不引新依赖）——
+_rate_lock = threading.Lock()
+_rate_buckets: dict = {}
+
+
+def _client_ip() -> str:
+    """优先取 Cloudflare 传来的真实访客 IP。"""
+    return request.headers.get("CF-Connecting-IP") or request.remote_addr or "?"
+
+
+def _rate_limited(scope: str, limit: int, window: int = 60) -> bool:
+    """window 秒内超过 limit 次返回 True。"""
+    now = time.monotonic()
+    key = (scope, _client_ip())
+    with _rate_lock:
+        hits = _rate_buckets.get(key)
+        if hits is None:
+            hits = deque()
+            _rate_buckets[key] = hits
+        while hits and now - hits[0] > window:
+            hits.popleft()
+        if len(hits) >= limit:
+            return True
+        hits.append(now)
+        if len(_rate_buckets) > 10000:  # 兜底防内存膨胀
+            _rate_buckets.clear()
+    return False
+
+
+def _report_cache_key() -> tuple:
+    """以数据目录内最新报告文件的 (文件名, mtime) 为键；fetcher 写新报告即失效。"""
+    latest_name = None
+    latest_mtime = 0.0
+    try:
+        for name in os.listdir(CACHE_DIR):
+            if not (name.startswith("report_") and name.endswith(".json")):
+                continue
+            try:
+                mtime = os.path.getmtime(os.path.join(CACHE_DIR, name))
+            except OSError:
+                continue
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+                latest_name = name
+    except OSError:
+        pass
+    return (latest_name, latest_mtime)
+
+
+def _get_report_cached() -> dict:
+    """按 mtime 键缓存 get_latest_report()，避免每请求重读+重解析 ~800KB JSON。"""
+    key = _report_cache_key()
+    with _page_cache_lock:
+        if _page_cache.get("key") == key and _page_cache.get("report") is not None:
+            return _page_cache["report"]
+    report = get_latest_report()
+    with _page_cache_lock:
+        if _page_cache.get("key") != key:
+            _page_cache.clear()
+            _hist_pt_cache.clear()
+            _page_cache["key"] = key
+        _page_cache["report"] = report
+    return report
+
+
+def _get_html_cached(can_refresh: bool) -> tuple:
+    """机主版/公开版 HTML 分开缓存；命中时不再重复渲染 1.4MB 页面。"""
+    key = _report_cache_key()
+    # 令牌指纹并入缓存键：轮换令牌后机主版立即失效，不残留旧令牌
+    token_fp = hashlib.sha256(
+        os.getenv("IB_RESEARCH_REFRESH_TOKEN", "").encode("utf-8")
+    ).hexdigest()[:12]
+    slot = f"html_owner:{token_fp}" if can_refresh else "html_public"
+    with _page_cache_lock:
+        if _page_cache.get("key") == key:
+            html = _page_cache.get(slot)
+            report = _page_cache.get("report")
+            if html is not None and report is not None:
+                return html, report
+    report = _get_report_cached()
+    html = _generate_html(report, can_refresh=can_refresh)
+    with _page_cache_lock:
+        if _page_cache.get("key") != key:
+            _page_cache.clear()
+            _hist_pt_cache.clear()
+            _page_cache["key"] = key
+            _page_cache["report"] = report
+        _page_cache[slot] = html
+    return html, report
+
+
+def _allowed_logo_symbols() -> frozenset:
+    """当前报告真实出现的 ticker 集合（归一化）+ 别名/覆盖表键。
+
+    只有集合内的 symbol 才允许触发上游抓取，公网刷随机 symbol 直接走占位图。
+    """
+    key = _report_cache_key()
+    with _page_cache_lock:
+        if _page_cache.get("key") == key and _page_cache.get("logo_symbols") is not None:
+            return _page_cache["logo_symbols"]
+    symbols = set(_logo_symbol_aliases) | set(_logo_source_overrides)
+    report = _get_report_cached()
+    summary = report.get("summary", {})
+    if isinstance(summary, str):
+        try:
+            summary = json.loads(summary)
+        except Exception:
+            summary = {}
+    if isinstance(summary, dict):
+        for item in summary.get("Asset_Targets", []) or []:
+            if isinstance(item, dict):
+                # 资产卡片用 Asset 字段(可能是代码或名称，非代码归一化后为空自动跳过)
+                normalized = _normalize_logo_symbol(item.get("Asset", ""))
+                if normalized:
+                    symbols.add(normalized)
+        for item in summary.get("Rating_Changes", []) or []:
+            if isinstance(item, dict):
+                normalized = _normalize_logo_symbol(item.get("Symbol", ""))
+                if normalized:
+                    symbols.add(normalized)
+    result = frozenset(symbols)
+    with _page_cache_lock:
+        if _page_cache.get("key") == key:
+            _page_cache["logo_symbols"] = result
+    return result
 _site_icon_svg = b"""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
 <rect width="64" height="64" rx="14" fill="#0b0b0c"/>
 <path d="M12 47V21h10v26zm15 0V11h10v36zm15 0V27h10v20z" fill="#c9a45c"/>
@@ -95,11 +234,13 @@ def _add_security_headers(response):
             "connect-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
         )
     if is_api:
+        # API 一律不落缓存、不进索引
         response.headers["Cache-Control"] = "no-store"
         response.headers["X-Robots-Tag"] = "noindex, nofollow"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
     elif is_html and response.status_code == 200:
+        # 公开 HTML 允许 CDN/搜索引擎缓存并索引（route 显式设置的优先）
         response.headers.setdefault(
             "Cache-Control",
             "public, max-age=120, s-maxage=300, stale-while-revalidate=1800",
@@ -114,6 +255,7 @@ def _add_security_headers(response):
 
 
 def _stock_href(symbol: str) -> str:
+    """关注池内的股票返回可索引的个股研究页 URL，否则返回空。"""
     ticker = str(symbol or "").strip().upper()
     if ticker in HOT_SYMBOLS:
         return f"/stocks/{ticker.lower()}/"
@@ -121,26 +263,31 @@ def _stock_href(symbol: str) -> str:
 
 
 def _load_env():
-    """加载环境变量"""
-    env_path = os.environ.get("IB_RESEARCH_ENV", os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+    """加载环境变量（容忍引号/export 前缀/CRLF）"""
+    env_path = os.path.expanduser(os.environ.get("IB_RESEARCH_ENV", "~/.openclaw/workspace/.env"))
     if os.path.exists(env_path):
         with open(env_path) as f:
             for line in f:
-                line = line.strip()
+                line = line.strip().lstrip("﻿")
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
                 if line and "=" in line and not line.startswith("#"):
                     k, v = line.split("=", 1)
-                    os.environ.setdefault(k, v)
+                    os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
 
-def _is_refresh_authorized_request() -> bool:
-    """令牌优先；未配置令牌时仅允许不经过 Cloudflare 的本机请求。"""
-    configured_token = os.getenv("IB_RESEARCH_REFRESH_TOKEN", "").strip()
-    if configured_token:
-        provided_token = request.headers.get("X-Refresh-Token", "")
-        return bool(provided_token) and hmac.compare_digest(provided_token, configured_token)
+def _request_host() -> str:
+    """解析 Host（兼容 [::1]:8081 形式），小写、去端口。"""
+    host_header = (request.host or "").strip()
+    if host_header.startswith("["):
+        return host_header[1:].split("]")[0].lower()
+    return host_header.split(":")[0].lower()
 
-    if request.headers.get("CF-Connecting-IP"):
-        return False
+
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _is_loopback_request() -> bool:
     try:
         address = ipaddress.ip_address(request.remote_addr or "")
     except ValueError:
@@ -148,6 +295,42 @@ def _is_refresh_authorized_request() -> bool:
     if address.is_loopback:
         return True
     return bool(address.version == 6 and address.ipv4_mapped and address.ipv4_mapped.is_loopback)
+
+
+def _is_refresh_authorized_request() -> bool:
+    """令牌优先；未配置令牌时仅允许不经过 Cloudflare 且 Host 指向本机的请求。"""
+    # 纵深防御：显式跨源的 POST（恶意网页的"localhost 路过式"请求）直接拒绝
+    origin = request.headers.get("Origin")
+    if origin:
+        origin_host = (urlparse(origin).hostname or "").lower()
+        if origin_host != _request_host():
+            return False
+
+    configured_token = os.getenv("IB_RESEARCH_REFRESH_TOKEN", "").strip()
+    if configured_token:
+        provided_token = request.headers.get("X-Refresh-Token", "")
+        return bool(provided_token) and hmac.compare_digest(provided_token, configured_token)
+
+    # 无令牌回退：loopback + 未经 Cloudflare + Host 白名单（防 DNS 重绑定）
+    if request.headers.get("CF-Connecting-IP"):
+        return False
+    if _request_host() not in _LOCAL_HOSTS:
+        return False
+    return _is_loopback_request()
+
+
+def _is_owner_request() -> bool:
+    """机主本人从本机浏览器访问：loopback + 未经 Cloudflare + Host 指向本机。
+
+    Host 校验用于防 DNS 重绑定——恶意域名解析到 127.0.0.1 时 Host 不是 localhost，
+    此时页面绝不能带刷新按钮和令牌。令牌只会出现在机主版 HTML 里，跨源 fetch
+    受同源策略限制读不到它。
+    """
+    if request.headers.get("CF-Connecting-IP"):
+        return False
+    if _request_host() not in _LOCAL_HOSTS:
+        return False
+    return _is_loopback_request()
 
 
 def _safe_text(value) -> str:
@@ -377,6 +560,8 @@ def _queue_logo_fetch(normalized: str) -> None:
     with _logo_pending_lock:
         if normalized in _logo_pending:
             return
+        if len(_logo_pending) >= _logo_pending_max:
+            return  # 队列已满：放弃回源，本轮用占位图
         _logo_pending.add(normalized)
     _logo_executor.submit(_background_logo_fetch, normalized)
 
@@ -390,7 +575,9 @@ def _get_logo_svg(symbol: str) -> tuple[bytes, str, str]:
     if cached is not None:
         body, mimetype = cached
         return body, mimetype, "cache"
-    _queue_logo_fetch(normalized)
+    # 白名单闸口：报告里没出现过的 symbol 绝不回源（防公网刷接口耗 Finnhub 配额）
+    if normalized in _allowed_logo_symbols():
+        _queue_logo_fetch(normalized)
     return _fallback_logo_svg(normalized), "image/svg+xml", "fallback"
 
 
@@ -415,6 +602,8 @@ def favicon_png():
 @app.route("/assets/logos/<path:symbol>.svg")
 def logo_asset(symbol: str):
     """让浏览器只访问本站；Cloudflare 可缓存所有 logo 和占位图。"""
+    if _rate_limited("logo", 120):
+        return Response("too many requests", status=429, mimetype="text/plain")
     body, mimetype, source = _get_logo_svg(symbol)
     response = Response(body, mimetype=mimetype)
     response.headers["Cache-Control"] = (
@@ -422,7 +611,8 @@ def logo_asset(symbol: str):
         if source != "fallback"
         else "private, no-cache, max-age=0"
     )
-    response.headers["X-Logo-Source"] = source
+    # 上游 SVG 只做了黑名单清洗；禁止脚本执行兜底直接导航场景的存储型 XSS
+    response.headers["Content-Security-Policy"] = "script-src 'none'"
     response.set_etag(hashlib.sha256(body).hexdigest())
     return response.make_conditional(request)
 
@@ -437,7 +627,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     if isinstance(summary, str):
         try:
             summary = json.loads(summary)
-        except:
+        except Exception:
             summary = {}
 
     # 提取专业结构字段
@@ -456,6 +646,10 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     news_count = len(raw.get("news", []))
     rec_count = len(raw.get("recommendations", []))
     refresh_mode = str(meta.get("refresh_mode", "full"))
+    # 令牌只注入机主版页面；公开访客的 HTML 不含此值
+    refresh_token_js = json.dumps(
+        os.getenv("IB_RESEARCH_REFRESH_TOKEN", "").strip() if can_refresh else ""
+    )
     try:
         pending_rating_count = max(
             0, int(meta.get("pending_rating_count", 0) or 0)
@@ -507,11 +701,15 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             </div>'''
 
     def _find_historical_price_target(symbol: str, bank: str, current_time: str) -> Optional[str]:
-        """从最近 7 天的报告中查找同一资产/投行的上一个目标价"""
+        """从最近 7 天的报告中查找同一资产/投行的上一个目标价（结果按报告日期缓存）"""
         try:
             current_dt = datetime.strptime(current_time[:10], "%Y-%m-%d")
         except Exception:
             return None
+        cache_key = (symbol, bank.lower(), current_time[:10])
+        if cache_key in _hist_pt_cache:
+            return _hist_pt_cache[cache_key]
+        result = None
         for days_back in range(1, 8):
             date = (current_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
             path = os.path.join(CACHE_DIR, f"report_{date}.json")
@@ -529,10 +727,14 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                     if (str(c.get("Symbol", "")).strip().upper() == symbol and
                         str(c.get("Bank", "")).strip().lower() == bank.lower() and
                         c.get("Price_Target")):
-                        return c.get("Price_Target")
+                        result = c.get("Price_Target")
+                        break
+                if result:
+                    break
             except Exception:
                 continue
-        return None
+        _hist_pt_cache[cache_key] = result
+        return result
 
     def _is_bernstein(text: str) -> bool:
         return "bernstein" in (text or "").lower()
@@ -1157,56 +1359,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 padding-bottom: 24px;
                 margin-bottom: 32px;
                 border-bottom: 1px solid var(--border);
-            }}
-            .site-nav {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 8px 16px;
-                align-items: center;
-                margin-bottom: 18px;
-            }}
-            .site-nav .brand {{
-                font-family: var(--font-serif);
-                font-size: 20px;
-                color: var(--text);
-                margin-right: 8px;
-                text-decoration: none;
-            }}
-            .site-nav a {{
-                color: var(--text-secondary);
-                font-size: 13px;
-                text-decoration: none;
-            }}
-            .site-nav a:hover,
-            .site-nav a[aria-current="page"] {{
-                color: var(--gold);
-            }}
-            a.asset-chip,
-            a.asset-ticker,
-            a.symbol {{
-                color: inherit;
-                text-decoration: none;
-            }}
-            a.asset-chip:hover,
-            a.asset-ticker:hover,
-            a.symbol:hover {{
-                color: var(--gold);
-            }}
-            .footer-nav {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 10px 16px;
-                margin-top: 28px;
-                padding-top: 16px;
-                border-top: 1px solid var(--border);
-                font-size: 13px;
-            }}
-            .footer-nav a {{ color: var(--text-secondary); }}
-            .stock-strip {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 8px;
-                margin-top: 16px;
             }}
             .edition {{
                 font-family: "JetBrains Mono", monospace;
@@ -2238,6 +2390,56 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 table {{ font-size: 13px; }}
                 tbody td {{ padding: 14px 12px; }}
             }}
+            .site-nav {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px 16px;
+                align-items: center;
+                margin-bottom: 18px;
+            }}
+            .site-nav .brand {{
+                font-family: var(--font-serif);
+                font-size: 20px;
+                color: var(--text);
+                margin-right: 8px;
+                text-decoration: none;
+            }}
+            .site-nav a {{
+                color: var(--text-secondary);
+                font-size: 13px;
+                text-decoration: none;
+            }}
+            .site-nav a:hover,
+            .site-nav a[aria-current="page"] {{
+                color: var(--gold);
+            }}
+            a.asset-chip,
+            a.asset-ticker,
+            a.symbol {{
+                color: inherit;
+                text-decoration: none;
+            }}
+            a.asset-chip:hover,
+            a.asset-ticker:hover,
+            a.symbol:hover {{
+                color: var(--gold);
+            }}
+            .footer-nav {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 10px 16px;
+                margin-top: 28px;
+                padding-top: 16px;
+                border-top: 1px solid var(--border);
+                font-size: 13px;
+            }}
+            .footer-nav a {{ color: var(--text-secondary); }}
+            .stock-strip {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 8px;
+                margin-top: 16px;
+            }}
             </style>
 </head>
 <body>
@@ -2499,6 +2701,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
 
     <div class="toast" id="toast"></div>
     <script>
+        const REFRESH_TOKEN = {refresh_token_js};
         function showToast(message, isError = false) {{
             const t = document.getElementById('toast');
             t.textContent = message;
@@ -2578,7 +2781,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             btn.classList.add('spinning');
             showToast(mode === 'fast' ? '正在快速刷新 (RSS)...' : '正在完整刷新...');
             try {{
-                const r = await fetch(`/api/ib-research/refresh?mode=${{mode}}`, {{ method: 'POST' }});
+                const r = await fetch(`/api/ib-research/refresh?mode=${{mode}}`, {{ method: 'POST', headers: {{ 'X-Refresh-Token': REFRESH_TOKEN }} }});
                 const j = await r.json();
                 if (j.status === 'ok') {{
                     showToast((j.message || '刷新完成') + '，即将重载页面');
@@ -2673,27 +2876,33 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
 @app.route("/api/ib-research")
 def api_ib_research():
     """JSON API: 返回最新研报总结"""
+    if _rate_limited("api", 30):
+        return jsonify({"status": "error", "message": "请求过于频繁"}), 429
     try:
-        report = get_latest_report()
+        report = _get_report_cached()
         return jsonify({
             "status": "ok",
             "data": report,
         })
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"[api_ib_research] {e!r}", file=sys.stderr)
+        return jsonify({"status": "error", "message": "内部错误"}), 500
 
 
 @app.route("/api/ib-research/raw")
 def api_ib_research_raw():
     """JSON API: 返回原始数据"""
+    if _rate_limited("api", 30):
+        return jsonify({"status": "error", "message": "请求过于频繁"}), 429
     try:
-        report = get_latest_report()
+        report = _get_report_cached()
         return jsonify({
             "status": "ok",
             "data": report.get("raw", {}),
         })
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"[api_ib_research_raw] {e!r}", file=sys.stderr)
+        return jsonify({"status": "error", "message": "内部错误"}), 500
 
 
 @app.route("/api/ib-research/refresh", methods=["POST"])
@@ -2755,27 +2964,29 @@ def api_refresh():
                 "generated_at": report.get("meta", {}).get("generated_at"),
             })
         except Exception as e:
-            return jsonify({"status": "error", "message": str(e)}), 500
+            print(f"[api_refresh] {e!r}", file=sys.stderr)
+            return jsonify({"status": "error", "message": "刷新执行失败，详情见服务端日志"}), 500
 
 
 @app.route("/")
 def index():
     """HTML报告页面"""
+    if _rate_limited("index", 60):
+        return Response("too many requests", status=429, mimetype="text/plain")
     try:
-        report = get_latest_report()
-        can_refresh = _is_refresh_authorized_request()
-        html = _generate_html(report, can_refresh=can_refresh)
+        html, _report = _get_html_cached(can_refresh=_is_owner_request())
         response = Response(html, mimetype="text/html")
-        if can_refresh:
-            response.headers["Cache-Control"] = "no-store"
-        else:
+        if request.headers.get("CF-Connecting-IP"):
             response.headers["Cache-Control"] = (
                 "public, max-age=60, s-maxage=300, stale-while-revalidate=600"
             )
+        else:
+            response.headers["Cache-Control"] = "no-store"
         response.set_etag(hashlib.sha256(html.encode("utf-8")).hexdigest())
         return response.make_conditional(request)
     except Exception as e:
-        return f"<h1>Error</h1><p>{e}</p>", 500
+        print(f"[index] {e!r}", file=sys.stderr)
+        return "<h1>Error</h1><p>服务内部错误，详情见服务端日志</p>", 500
 
 
 register_geo_routes(app)
@@ -2783,15 +2994,18 @@ register_geo_routes(app)
 
 if __name__ == "__main__":
     _load_env()
+    _bind_host = os.getenv("IB_RESEARCH_BIND_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    # 不对外泄露 Werkzeug/Python 版本指纹
+    from werkzeug.serving import WSGIRequestHandler
+    WSGIRequestHandler.server_version = "ib-research"
+    WSGIRequestHandler.sys_version = ""
     print("=" * 60)
     print("外资投行研报总结服务")
     print("=" * 60)
     print("端点:")
     print("  http://localhost:8081/                -> HTML报告")
-    print("  http://localhost:8081/robots.txt      -> robots")
-    print("  http://localhost:8081/sitemap.xml     -> sitemap")
-    print("  http://localhost:8081/stocks/nvda/    -> 个股研究页")
     print("  http://localhost:8081/api/ib-research -> JSON API")
-    print("  POST http://localhost:8081/api/ib-research/refresh -> 手动刷新")
+    print("  POST http://localhost:8081/api/ib-research/refresh -> 手动刷新(需令牌)")
+    print(f"  绑定地址: {_bind_host}:8081 (IB_RESEARCH_BIND_HOST 可覆盖)")
     print("=" * 60)
-    app.run(host="0.0.0.0", port=8081, debug=False)
+    app.run(host=_bind_host, port=8081, debug=False)

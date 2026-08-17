@@ -16,7 +16,7 @@ import sys
 import urllib.request
 from datetime import datetime, timezone, timedelta
 
-CACHE_DIR = os.environ.get("IB_RESEARCH_CACHE_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ib_research"))
+CACHE_DIR = os.path.expanduser(os.environ.get("IB_RESEARCH_CACHE_DIR", "~/.openclaw/workspace/data/ib_research"))
 
 
 def _load_recent_reports(days: int = 7, files: list = None) -> list:
