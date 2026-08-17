@@ -24,6 +24,7 @@ CONTACT_EMAIL = "shangchaoxie888@gmail.com"
 X_PROFILE_URL = "https://x.com/johny_xie"
 X_HANDLE = "@johny_xie"
 DEFAULT_ORIGIN = "https://fresearch.cc.cd"
+GOOGLE_SITE_VERIFICATION = "s8mvn7tXPvT_q4BHyD2tZAXPFuj3xdUSksDjR6BCj1g"
 
 # 手写知识页与主题页的首次发布日（内容变更时更新）。
 CONTENT_PUBLISHED = "2026-08-17"
@@ -612,6 +613,7 @@ def seo_head(
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>{_safe_text(title)}</title>
 <meta name="description" content="{og_desc}">
+<meta name="google-site-verification" content="{GOOGLE_SITE_VERIFICATION}">
 <meta name="robots" content="{robots}">
 <link rel="canonical" href="{_safe_attr(canonical)}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=2">

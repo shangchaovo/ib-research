@@ -87,6 +87,10 @@ class GeoPagesTest(unittest.TestCase):
         html = response.get_data(as_text=True)
         self.assertIn("<title>FResearch - AI金融研究平台", html)
         self.assertIn('name="description"', html)
+        self.assertIn(
+            'name="google-site-verification" content="s8mvn7tXPvT_q4BHyD2tZAXPFuj3xdUSksDjR6BCj1g"',
+            html,
+        )
         self.assertIn('rel="canonical"', html)
         self.assertIn("application/ld+json", html)
         self.assertIn("<h1", html)
