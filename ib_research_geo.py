@@ -14,12 +14,14 @@ from typing import Any, Optional
 from urllib.parse import quote
 from xml.sax.saxutils import escape as xml_escape
 
-from flask import Response, abort
+from flask import Response, abort, redirect
 
+from design_system import PAGE_CSS
 from ib_research_fetcher import HOT_SYMBOLS, TARGET_BANKS, get_latest_report
+from institution_intelligence import ACTION_LABELS, TRACKED_INSTITUTIONS, build_institution_intelligence
 
 SITE_NAME = "FResearch"
-SITE_TAGLINE = "AI金融研究平台｜投行研报、股票研究与市场分析"
+SITE_TAGLINE = "投行目标价与研报观点追踪｜市场反应与机构情绪"
 CONTACT_EMAIL = "shangchaoxie888@gmail.com"
 X_PROFILE_URL = "https://x.com/johny_xie"
 X_HANDLE = "@johny_xie"
@@ -27,7 +29,7 @@ DEFAULT_ORIGIN = "https://fresearch.cc.cd"
 GOOGLE_SITE_VERIFICATION = "s8mvn7tXPvT_q4BHyD2tZAXPFuj3xdUSksDjR6BCj1g"
 
 # 手写知识页与主题页的首次发布日（内容变更时更新）。
-CONTENT_PUBLISHED = "2026-08-17"
+CONTENT_PUBLISHED = "2026-08-30"
 
 
 def public_origin() -> str:
@@ -314,6 +316,63 @@ TOPIC_PAGES: dict[str, dict] = {
     },
 }
 
+RESEARCH_LENS_PAGES: dict[str, dict] = {
+    "price-targets": {
+        "slug": "price-targets",
+        "title": "投行目标价怎么看｜上调、下调与一致预期",
+        "h1": "投行目标价与评级动作",
+        "description": "解释投行目标价、评级上调与下调如何归集，区分单家机构目标价、分析师一致预期和未经验证的模型数字。",
+        "one_liner": "先确认是谁、何时、把什么从多少调到多少，再讨论目标价意味着什么。",
+        "stocks": HOT_SYMBOLS[:12],
+        "sections": [
+            ("一条目标价需要哪些证据？", "至少需要机构、股票、日期、动作与可回溯的公开来源。只有模型推断、没有共识或标题交叉验证的数字不会进入目标价卡。"),
+            ("单家目标价和一致预期", "单家目标价反映某一机构的估值假设，一致预期是多位分析师的聚合。两者不能混写成同一个结论，页面会分别标注来源等级。"),
+            ("上调目标价不等于上调评级", "机构可能维持 Hold 同时上调目标价，也可能维持 Buy 同时下调目标价。评级方向和目标价方向要分开阅读。"),
+            ("下一步看市场验证", "公开动作只是事件起点。FResearch 再观察其后 1、5、20 个交易日相对 SPY 的表现，区分市场确认、未确认和样本不足。"),
+        ],
+    },
+    "institution-views": {
+        "slug": "institution-views",
+        "title": "机构研报观点聚合｜共识、分歧与连续动作",
+        "h1": "机构观点聚合",
+        "description": "按高盛、摩根士丹利、摩根大通等机构聚合近期评级、目标价动作与公开研报观点，观察共识、分歧和边际变化。",
+        "one_liner": "把同一机构近期对不同股票的公开动作放在一起，才看得见它的边际倾向。",
+        "stocks": HOT_SYMBOLS[:12],
+        "sections": [
+            ("观点如何整合？", "只归纳公开标题、可公开摘要和结构化评级字段明确表达的内容；缺少理由时保留为空，不让模型补写机构没有说过的话。"),
+            ("如何判断偏多或偏空？", "评级上调和目标价上调记为公开偏多动作；下调记为公开偏空动作；重申评级按评级本身的方向分类。"),
+            ("为什么要看连续动作？", "单次调价可能是估值参数更新，连续覆盖多个标的或前后反转更能说明公开观点的边际变化，但仍不等于机构真实持仓。"),
+        ],
+    },
+    "market-reaction": {
+        "slug": "market-reaction",
+        "title": "投行观点后的市场反应｜1、5、20日相对收益",
+        "h1": "观点后的市场反应",
+        "description": "追踪投行评级和目标价发布后股票 1、5、20 个交易日相对 SPY 的表现，识别市场确认、未确认与尚待观察。",
+        "one_liner": "观点是否响亮不重要，随后价格是否同向、样本是否成熟更重要。",
+        "stocks": HOT_SYMBOLS[:12],
+        "sections": [
+            ("市场反应怎么计算？", "从事件前一交易日收盘开始，计算其后 1、5、20 个交易日的复权收益，并与 SPY 同期收益比较。"),
+            ("为什么只能说确认或未确认？", "事件通常只有日期、没有盘前盘后时间；同日还可能有财报或多家机构动作。因此相对收益是验证线索，不是单一事件的因果证明。"),
+            ("观察窗口不够怎么办？", "未满对应交易日的事件显示等待验证，不拿当日快照冒充完整的 5 日或 20 日结果。"),
+        ],
+    },
+    "institution-signals": {
+        "slug": "institution-signals",
+        "title": "机构公开信号与市场确认度｜审慎识别言行背离",
+        "h1": "机构信号一致性",
+        "description": "比较机构公开评级、目标价方向与后续市场表现，展示方向一致率、样本量和置信度，不推断未披露交易意图。",
+        "one_liner": "把‘公开怎么说’与‘市场后来怎么走’分开，才能审慎讨论信号是否可信。",
+        "stocks": HOT_SYMBOLS[:12],
+        "sections": [
+            ("什么叫公开信号背离？", "例如评级偏多但目标价下调，或公开偏多后股票相对 SPY 下跌。页面称其为信号混合或市场未确认，不称为出货或操纵。"),
+            ("为什么不能推断真实意图？", "卖方研究、交易、投行和资管部门可能彼此独立。公开评级不能证明自营盘、客户盘或关联资管实体的持仓方向。"),
+            ("置信度从哪里来？", "置信度取决于可验证事件数、成熟观察窗口、来源完整度和同日混杂因素。低样本只展示事实，不做机构排名。"),
+        ],
+    },
+}
+
+
 LEARN_PAGES: dict[str, dict] = {
     "pe-ratio": {
         "slug": "pe-ratio",
@@ -535,67 +594,173 @@ TRUST_PAGES = ("about", "methodology", "ai-methodology", "sources", "editorial-p
 # Shared chrome
 # ---------------------------------------------------------------------------
 
-_GEO_CSS = """
-:root {
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
-  --font-serif: "Iowan Old Style", "Songti SC", "STSong", Georgia, serif;
-  --font-mono: "SFMono-Regular", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
-  --bg: #08080a; --surface: #12121a; --surface-2: #1a1a24;
-  --border: rgba(232,230,227,.08); --text: #f2f0ec; --muted: #9a9791;
-  --gold: #c9a45c; --gold-dim: rgba(201,164,92,.12); --bull: #4ade80; --bear: #f87171;
+_GEO_ONLY_CSS = """
+/* 子页专属：机构信号卡与目标价共识块 */
+.meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px 20px;
+    color: var(--text-tertiary);
+    font-size: 12.5px;
+    margin-bottom: 24px;
 }
-*{box-sizing:border-box}
-html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--font-sans);line-height:1.65}
-a{color:var(--gold);text-decoration:none}
-a:hover{text-decoration:underline}
-.wrap{max-width:1080px;margin:0 auto;padding:28px 22px 80px}
-.site-nav{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;margin-bottom:28px;padding-bottom:16px;border-bottom:1px solid var(--border)}
-.site-nav .brand{font-family:var(--font-serif);font-size:20px;color:var(--text);margin-right:8px}
-.site-nav a{color:var(--muted);font-size:13px}
-.site-nav a:hover,.site-nav a[aria-current="page"]{color:var(--gold)}
-.crumb{font-size:12px;color:var(--muted);margin-bottom:18px}
-.crumb a{color:var(--muted)}
-h1{font-family:var(--font-serif);font-size:clamp(28px,5vw,44px);line-height:1.2;margin:0 0 12px}
-.one-liner{font-size:18px;color:var(--text);margin:0 0 20px}
-.lede{color:var(--muted);margin:0 0 28px}
-.panel{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:22px 24px;margin:0 0 18px}
-h2{font-size:18px;margin:0 0 10px;color:var(--gold);letter-spacing:.04em}
-p{margin:0 0 12px}
-.meta-row{display:flex;flex-wrap:wrap;gap:10px 18px;color:var(--muted);font-size:13px;margin-bottom:22px}
-.chip-row{display:flex;flex-wrap:wrap;gap:8px;margin:12px 0 4px}
-.chip{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--border);border-radius:999px;padding:6px 12px;color:var(--text);background:var(--surface-2);font-size:13px}
-.chip:hover{border-color:var(--gold);text-decoration:none}
-.chip img{width:18px;height:18px;border-radius:4px}
-table{width:100%;border-collapse:collapse;font-size:14px}
-th,td{text-align:left;padding:10px 8px;border-bottom:1px solid var(--border);vertical-align:top}
-th{color:var(--muted);font-size:12px;font-weight:600}
-.mono{font-family:var(--font-mono);font-size:13px}
-.muted{color:var(--muted)}
-.footer-nav{display:flex;flex-wrap:wrap;gap:10px 16px;margin-top:36px;padding-top:18px;border-top:1px solid var(--border);font-size:13px}
-.footer-nav a{color:var(--muted)}
-.disclaimer{margin-top:18px;font-size:12px;color:var(--muted);line-height:1.7}
-.kv{display:grid;grid-template-columns:160px 1fr;gap:8px 16px;font-size:14px}
-.kv div:nth-child(odd){color:var(--muted)}
-.source-list{padding-left:18px;margin:0}
-.source-list li{margin:0 0 6px}
-.empty{color:var(--muted);font-size:14px}
-.logo{width:36px;height:36px;border-radius:8px;vertical-align:middle;margin-right:8px}
-@media (max-width:640px){
-  .kv{grid-template-columns:1fr}
-  .wrap{padding:22px 16px 64px}
+.signal-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+    gap: 16px;
+    margin: 0 0 24px;
+}
+.signal-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    padding: 20px 22px;
+    position: relative;
+    overflow: hidden;
+    transition: border-color 0.25s var(--ease-out);
+}
+.signal-card:hover { border-color: var(--border-strong); }
+.signal-card:after {
+    content: "";
+    position: absolute;
+    width: 110px;
+    height: 110px;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    right: -45px;
+    bottom: -55px;
+}
+.signal-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 10px;
+}
+.signal-head h2 {
+    margin: 0;
+    font-family: var(--font-serif);
+    font-size: 20px;
+    letter-spacing: 0;
+    color: var(--text);
+}
+.signal-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 7px 14px;
+    color: var(--text-tertiary);
+    font-size: 12px;
+    margin-bottom: 10px;
+}
+
+/* 目标价共识：现价 / 一致目标价 / 隐含空间 */
+.consensus {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 1px;
+    background: var(--border);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    overflow: hidden;
+    margin: 0 0 20px;
+}
+.consensus-cell { background: var(--surface); padding: 18px 20px; }
+.consensus-label {
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    color: var(--text-tertiary);
+    margin-bottom: 7px;
+}
+.consensus-value {
+    font-family: var(--font-mono);
+    font-size: 25px;
+    font-weight: 500;
+    line-height: 1.15;
+    color: var(--text);
+    font-variant-numeric: tabular-nums;
+}
+.consensus-value.is-bull { color: var(--bull); }
+.consensus-value.is-bear { color: var(--bear); }
+.consensus-sub { margin-top: 6px; font-size: 11.5px; color: var(--text-tertiary); }
+
+/* 目标价区间条 */
+.pt-range { margin: 4px 0 0; }
+.pt-range-bar {
+    position: relative;
+    height: 6px;
+    border-radius: 999px;
+    background: var(--surface-3);
+    margin: 14px 0 8px;
+}
+.pt-range-span {
+    position: absolute;
+    top: 0;
+    height: 6px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, rgba(201, 164, 92, 0.35), var(--gold));
+}
+.pt-range-marker {
+    position: absolute;
+    top: -4px;
+    width: 2px;
+    height: 14px;
+    background: var(--text);
+    border-radius: 1px;
+}
+.pt-range-scale {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-tertiary);
+}
+.pt-range-legend {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--font-sans);
+    letter-spacing: 0.02em;
+}
+.pt-range-legend i {
+    display: inline-block;
+    border-radius: 2px;
+}
+.pt-legend-marker { width: 3px; height: 12px; background: var(--text-primary); }
+.pt-legend-span { width: 16px; height: 4px; margin-left: 6px; background: var(--accent); opacity: 0.75; }
+@media (max-width: 640px) {
+    .pt-range-legend { display: none; }
+}
+.viewpoint-list { list-style: none; padding: 0; margin: 0; }
+.viewpoint-list li {
+    display: grid;
+    grid-template-columns: 150px 1fr auto;
+    gap: 10px 16px;
+    align-items: baseline;
+    padding: 12px 0;
+    border-top: 1px solid var(--border);
+}
+.viewpoint-list li:first-child { border-top: 0; }
+.viewpoint-bank { font-size: 14px; }
+.viewpoint-text { color: var(--text-secondary); font-size: 13.5px; line-height: 1.65; }
+.viewpoint-date { font-family: var(--font-mono); font-size: 11.5px; color: var(--text-tertiary); }
+@media (max-width: 760px) {
+    .reaction-table { min-width: 860px; }
+    .viewpoint-list li { grid-template-columns: 1fr; gap: 4px; }
 }
 """
+
+_GEO_CSS = PAGE_CSS + _GEO_ONLY_CSS
 
 
 def site_nav_html(current: str = "") -> str:
     links = [
-        ("/", "研报"),
-        ("/stocks/", "股票"),
-        ("/topics/", "主题"),
-        ("/learn/", "知识"),
-        ("/compare/", "对比"),
-        ("/methodology/", "方法"),
-        ("/about/", "关于"),
+        ("/", "最新观点"),
+        ("/stocks/", "股票目标价"),
+        ("/institutions/", "机构观点"),
+        ("/reactions/", "市场验证"),
+        ("/methodology/", "研究方法"),
     ]
     items = []
     for href, label in links:
@@ -605,23 +770,72 @@ def site_nav_html(current: str = "") -> str:
         '<nav class="site-nav" aria-label="站点">'
         f'<a class="brand" href="/">{SITE_NAME}</a>'
         + "".join(items)
+        + '<span class="nav-spacer"></span>'
+        + theme_switcher_html()
         + "</nav>"
     )
 
 
+_THEME_ICONS = {
+    "dark": '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>',
+    "light": (
+        '<circle cx="12" cy="12" r="4"/><line x1="12" y1="1" x2="12" y2="4"/>'
+        '<line x1="12" y1="20" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/>'
+        '<line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="4" y2="12"/>'
+        '<line x1="20" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/>'
+        '<line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>'
+    ),
+    "sepia": '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+}
+_THEME_TITLES = {"dark": "暗色", "light": "明亮", "sepia": "护眼"}
+
+
+def theme_switcher_html() -> str:
+    buttons = []
+    for theme, icon in _THEME_ICONS.items():
+        active = " active" if theme == "dark" else ""
+        title = _THEME_TITLES[theme]
+        buttons.append(
+            f'<button type="button" class="theme-btn{active}" data-theme="{theme}"'
+            f' onclick="setTheme(\'{theme}\')" title="{title}" aria-label="{title}主题">'
+            '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+            f' stroke-linecap="round" stroke-linejoin="round">{icon}</svg></button>'
+        )
+    return (
+        '<div class="theme-switcher" role="group" aria-label="切换主题">'
+        + "".join(buttons)
+        + "</div>"
+    )
+
+
+# 子页没有首页那套脚本，主题切换需要自带一份最小实现（与首页同一个
+# localStorage key，跨页切换保持一致）。
+THEME_SCRIPT = """<script>
+function setTheme(theme){
+  if(['dark','light','sepia'].indexOf(theme)===-1){theme='dark';}
+  document.documentElement.setAttribute('data-theme',theme);
+  try{localStorage.setItem('ib-theme',theme);}catch(e){}
+  document.querySelectorAll('.theme-btn').forEach(function(b){
+    b.classList.toggle('active', b.dataset.theme===theme);
+  });
+}
+(function(){var s='dark';try{s=localStorage.getItem('ib-theme')||'dark';}catch(e){}setTheme(s);})();
+</script>"""
+
+
 def site_footer_nav_html(include_disclaimer: bool = True) -> str:
     links = [
-        ("/", "最新研报"),
-        ("/stocks/", "股票库"),
-        ("/topics/ai/", "AI 主题"),
-        ("/learn/", "知识库"),
+        ("/", "最新观点"),
+        ("/stocks/", "股票目标价"),
+        ("/institutions/", "机构观点"),
+        ("/reactions/", "市场验证"),
+        ("/topics/", "分析框架"),
         ("/methodology/", "研究方法"),
         ("/sources/", "数据来源"),
         ("/ai-methodology/", "AI 方法"),
         ("/editorial-policy/", "编辑标准"),
         ("/disclosures/", "披露"),
         ("/about/", "关于"),
-        ("/ai-info/", "AI Info"),
     ]
     items = "".join(f'<a href="{href}">{label}</a>' for href, label in links)
     disclaimer = (
@@ -655,12 +869,14 @@ def seo_head(
     schemas: list[dict],
     date_modified: str = "",
     include_style: bool = True,
+    robots_directive: str = "index,follow,max-image-preview:large,max-snippet:-1",
 ) -> str:
     canonical = _abs(canonical_path)
     og_image = _abs("/og-image.png")
-    robots = "index,follow,max-image-preview:large,max-snippet:-1"
+    robots = robots_directive
     og_title = _safe_attr(title)
     og_desc = _safe_attr(description)
+    og_type = "article" if any(str(item.get("@type")) == "Article" for item in schemas) else "website"
     modified_tag = (
         f'<meta property="article:modified_time" content="{_safe_attr(_iso_date(date_modified))}" />'
         if date_modified
@@ -676,7 +892,7 @@ def seo_head(
 <link rel="canonical" href="{_safe_attr(canonical)}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=2">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2">
-<meta property="og:type" content="website">
+<meta property="og:type" content="{og_type}">
 <meta property="og:site_name" content="{SITE_NAME}">
 <meta property="og:title" content="{og_title}">
 <meta property="og:description" content="{og_desc}">
@@ -687,9 +903,12 @@ def seo_head(
 <meta property="og:image:height" content="630">
 <meta property="og:image:type" content="image/png">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:site" content="{X_HANDLE}">
+<meta name="twitter:creator" content="{X_HANDLE}">
 <meta name="twitter:title" content="{og_title}">
 <meta name="twitter:description" content="{og_desc}">
 <meta name="twitter:image" content="{_safe_attr(og_image)}">
+<meta name="twitter:image:alt" content="{og_title}">
 {modified_tag}
 {"".join(_json_ld(item) for item in schemas)}
 {f"<style>{_GEO_CSS}</style>" if include_style else ""}
@@ -705,18 +924,20 @@ def render_page(
     current_nav: str = "",
     date_modified: str = "",
     lang: str = "zh-CN",
+    robots_directive: str = "index,follow,max-image-preview:large,max-snippet:-1",
 ) -> str:
     return f"""<!DOCTYPE html>
 <html lang="{lang}">
 <head>
-{seo_head(title, description, canonical_path, schemas, date_modified)}
+{seo_head(title, description, canonical_path, schemas, date_modified, robots_directive=robots_directive)}
 </head>
 <body>
 <div class="wrap">
 {site_nav_html(current_nav)}
-{body}
+<main>{body}</main>
 {site_footer_nav_html()}
 </div>
+{THEME_SCRIPT}
 </body>
 </html>"""
 
@@ -731,7 +952,7 @@ def organization_schema() -> dict:
         "logo": _abs("/favicon.svg"),
         "email": CONTACT_EMAIL,
         "sameAs": [X_PROFILE_URL],
-        "description": "面向投资者的 AI 金融研究平台，聚合外资投行研报、评级变动与市场数据。",
+        "description": "聚合外资投行股票评级、目标价与公开研报观点，并追踪观点发布后的市场反应。",
     }
 
 
@@ -748,14 +969,23 @@ def website_schema() -> dict:
 
 
 def software_schema() -> dict:
+    """只在 /about/ 使用——那一页的主体确实是这个工具本身。"""
     return {
         "@context": "https://schema.org",
         "@type": "SoftwareApplication",
+        "@id": _abs("/about/") + "#software",
         "name": SITE_NAME,
         "applicationCategory": "FinanceApplication",
+        "applicationSubCategory": "Sell-side research tracker",
         "operatingSystem": "Web",
         "url": _abs("/"),
-        "description": "追踪外资投行对 AI 算力与半导体主线的评级、目标价与研报摘要。",
+        "description": "追踪外资投行股票评级、目标价、公开研报观点及其后 1、5、20 个交易日市场反应。",
+        "featureList": [
+            "投行评级与目标价变动时间线",
+            "公开观点发布后 1/5/20 日相对 SPY 超额收益",
+            "按机构聚合的方向一致率",
+        ],
+        "isAccessibleForFree": True,
         "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
         "publisher": {"@type": "Organization", "name": SITE_NAME},
     }
@@ -787,7 +1017,8 @@ def article_schema(headline: str, description: str, path: str, date_modified: st
         "dateModified": date_value,
         "author": {"@type": "Organization", "name": SITE_NAME, "url": _abs("/about/")},
         "publisher": organization_schema(),
-        "mainEntityOfPage": _abs(path),
+        "mainEntityOfPage": {"@type": "WebPage", "@id": _abs(path)},
+        "image": _abs("/og-image.png"),
     }
 
 
@@ -815,23 +1046,26 @@ def _faq_schema(page: dict) -> Optional[dict]:
     for heading, text in page.get("sections", []):
         if str(heading).strip().endswith(("？", "?")):
             _add(heading, text)
-    if not qa:
+    # 单条问答的 FAQPage 不符合 Google 的富媒体条件，反而是低质结构化数据信号。
+    if len(qa) < 2:
         return None
     return {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": qa[:6]}
 
 
 def homepage_head_html(date_range: str = "", generated_at: str = "") -> str:
-    title = f"{SITE_NAME} - {SITE_TAGLINE}"
+    title = f"投行目标价与研报观点追踪｜市场反应与机构情绪 - {SITE_NAME}"
     description = (
-        "FResearch 是面向投资者的 AI 金融研究平台，聚合外资投行研报、评级变动与市场数据，"
-        "覆盖英伟达、台积电、博通等 AI 算力与半导体主线，帮助完成股票研究与投资分析。"
+        "聚合高盛、摩根士丹利、摩根大通等机构对美股的评级、目标价与公开研报观点，"
+        "追踪发布后的1、5、20日相对表现，观察机构公开表态与市场反应是否一致。"
     )
     if date_range and date_range not in {"N/A", ""}:
         description += f" 当前覆盖区间：{date_range}。"
+    # 首页的主体是研报事件集合(CollectionPage)，不是一个"应用"。同页再挂
+    # SoftwareApplication 属于类型错配，Google 只会当噪声忽略，还可能连带
+    # 让整页标记不被信任；它只保留在 /about/ ——那页确实在介绍这个工具。
     schemas = [
         organization_schema(),
         website_schema(),
-        software_schema(),
         webpage_schema(title, description, "/", "CollectionPage"),
     ]
     return seo_head(title, description, "/", schemas, generated_at, include_style=False)
@@ -853,14 +1087,20 @@ def extract_symbol_slice(report: dict, symbol: str) -> dict:
     symbol = symbol.upper()
     summary = _parse_summary(report)
     changes = [
-        item
+        dict(item)
         for item in (summary.get("Rating_Changes") or [])
         if isinstance(item, dict) and str(item.get("Symbol") or "").strip().upper() == symbol
     ]
     targets = [
         item
         for item in (summary.get("Asset_Targets") or [])
-        if isinstance(item, dict) and str(item.get("Asset") or "").strip().upper() == symbol
+        if isinstance(item, dict)
+        and str(item.get("Asset") or "").strip().upper() == symbol
+        and (
+            item.get("_Source") in {"av_consensus", "verified_headline", "verified_summary", "yahoo_structured"}
+            or item.get("_Verified_PT")
+            or item.get("_Consensus")
+        )
     ]
     news_items = []
     raw_news = ((report.get("raw") or {}).get("news") or []) if isinstance(report, dict) else []
@@ -873,9 +1113,36 @@ def extract_symbol_slice(report: dict, symbol: str) -> dict:
             for t in tickers
         )
         blob = f"{item.get('title', '')} {item.get('summary', '')}".upper()
-        if ticker_hit or symbol in blob:
+        symbol_hit = re.search(
+            rf"(?<![A-Z0-9]){re.escape(symbol)}(?![A-Z0-9])",
+            blob,
+        ) is not None
+        if ticker_hit or symbol_hit:
             news_items.append(item)
         if len(news_items) >= 8:
+            break
+    url_by_title = {
+        str(item.get("title") or "").strip(): str(item.get("url") or "").strip()
+        for item in raw_news
+        if isinstance(item, dict) and item.get("title") and item.get("url")
+    }
+    for change in changes:
+        headline = str(change.get("_Headline") or "").strip()
+        if headline and not change.get("_Source_URL"):
+            change["_Source_URL"] = url_by_title.get(headline, "")
+    history = ((report.get("market_context") or {}).get("history") or {}) if isinstance(report, dict) else {}
+    series = history.get(symbol) or []
+    last_close = None
+    last_close_date = ""
+    if isinstance(series, list):
+        for point in reversed(series):
+            if not isinstance(point, dict):
+                continue
+            try:
+                last_close = float(point.get("close"))
+            except (TypeError, ValueError):
+                continue
+            last_close_date = str(point.get("date") or "")
             break
     return {
         "changes": changes,
@@ -883,7 +1150,181 @@ def extract_symbol_slice(report: dict, symbol: str) -> dict:
         "news": news_items,
         "generated_at": _report_generated_at(report),
         "core_thesis": str(summary.get("Core_Thesis") or ""),
+        "last_close": last_close,
+        "last_close_date": last_close_date,
     }
+
+
+def _to_price(value: Any) -> Optional[float]:
+    """从 '$182.50' / '182.5' / 182.5 里取出数字。"""
+    if value is None:
+        return None
+    text = str(value).replace(",", "").strip()
+    match = re.search(r"-?\d+(?:\.\d+)?", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0))
+    except ValueError:
+        return None
+
+
+def _plausible_targets(
+    targets: list[tuple[str, float]]
+) -> tuple[list[tuple[str, float]], int]:
+    """剔除明显离群的目标价，返回 (保留项, 被剔除数量)。
+
+    上游标题解析偶尔会吐出截断或串标的的数字（实测有 NVDA 的 `$31`
+    和 `$1,150`）。单个离群值就能把共识区间拉成毫无意义的宽带，所以按
+    中位数的 1/3 ~ 3 倍设可信带；剔除数量会在页面上如实标注。
+    """
+    if len(targets) < 3:
+        return targets, 0
+    prices = sorted(price for _, price in targets)
+    median = prices[len(prices) // 2]
+    if median <= 0:
+        return targets, 0
+    low, high = median / 3, median * 3
+    kept = [(bank, price) for bank, price in targets if low <= price <= high]
+    return (kept, len(targets) - len(kept)) if kept else (targets, 0)
+
+
+def _consensus_panel(slice_data: dict, symbol: str) -> str:
+    """现价 / 一致目标价 / 隐含空间 三联卡 + 各家目标价区间条。
+
+    这是股票页上最该被一眼看到的东西，之前埋在 kv 表和项目符号里。
+    """
+    last_close = slice_data.get("last_close")
+    targets = slice_data.get("targets") or []
+    consensus_pt = None
+    week_low = week_high = None
+    if targets:
+        consensus = targets[0].get("_Consensus") or {}
+        consensus_pt = _to_price(consensus.get("analyst_target_price")) or _to_price(
+            targets[0].get("_Verified_PT") or targets[0].get("Target_Price")
+        )
+        week_low = _to_price(consensus.get("week_52_low"))
+        week_high = _to_price(consensus.get("week_52_high"))
+
+    # 各家投行公开目标价，用来画共识区间
+    raw_targets = []
+    for change in slice_data.get("changes") or []:
+        price = _to_price(change.get("Price_Target"))
+        if price:
+            raw_targets.append((str(change.get("Bank") or "—"), price))
+    bank_targets, dropped = _plausible_targets(raw_targets)
+
+    if last_close is None and consensus_pt is None and not bank_targets:
+        return ""
+
+    cells = []
+    if last_close is not None:
+        as_of = slice_data.get("last_close_date") or ""
+        cells.append(
+            '<div class="consensus-cell"><div class="consensus-label">最新收盘</div>'
+            f'<div class="consensus-value">${last_close:,.2f}</div>'
+            f'<div class="consensus-sub">复权收盘 · {_safe_text(as_of)}</div></div>'
+        )
+    if consensus_pt is not None:
+        cells.append(
+            '<div class="consensus-cell"><div class="consensus-label">一致目标价</div>'
+            f'<div class="consensus-value">${consensus_pt:,.2f}</div>'
+            '<div class="consensus-sub">Alpha Vantage 卖方一致预期</div></div>'
+        )
+    if last_close and consensus_pt:
+        implied = consensus_pt / last_close - 1
+        tone = "is-bull" if implied > 0 else "is-bear" if implied < 0 else ""
+        cells.append(
+            '<div class="consensus-cell"><div class="consensus-label">隐含空间</div>'
+            f'<div class="consensus-value {tone}">{implied:+.1%}</div>'
+            '<div class="consensus-sub">一致目标价相对最新收盘</div></div>'
+        )
+    if bank_targets:
+        low = min(price for _, price in bank_targets)
+        high = max(price for _, price in bank_targets)
+        note = f"{len(bank_targets)} 家近 30 日公开目标价"
+        if dropped:
+            note += f" · 已剔除 {dropped} 个异常值"
+        # 只有一个价位时写成 "$455–$455" 像坏数据，直接改成单值口径。
+        if low == high:
+            label, value = "公开目标价", f"${low:,.0f}"
+        else:
+            label, value = "公开目标价区间", f"${low:,.0f}–${high:,.0f}"
+        cells.append(
+            f'<div class="consensus-cell"><div class="consensus-label">{label}</div>'
+            f'<div class="consensus-value">{value}</div>'
+            f'<div class="consensus-sub">{_safe_text(note)}</div></div>'
+        )
+
+    range_html = ""
+    scale_low = min(
+        [value for value in (week_low, last_close) if value]
+        + [price for _, price in bank_targets]
+        or [0]
+    )
+    scale_high = max(
+        [value for value in (week_high, last_close) if value]
+        + [price for _, price in bank_targets]
+        or [1]
+    )
+    # 只有一个目标价时区间条退化成一条线，反而误导；至少两个不同价位才画。
+    if len({price for _, price in bank_targets}) >= 2 and scale_high > scale_low:
+        span = scale_high - scale_low
+
+        def _pos(value: float) -> float:
+            return max(0.0, min(100.0, (value - scale_low) / span * 100))
+
+        low = min(price for _, price in bank_targets)
+        high = max(price for _, price in bank_targets)
+        marker = (
+            f'<span class="pt-range-marker" style="left:{_pos(last_close):.1f}%" '
+            f'title="最新收盘 ${last_close:,.2f}"></span>'
+            if last_close
+            else ""
+        )
+        range_html = f"""
+<div class="pt-range">
+  <div class="pt-range-bar">
+    <span class="pt-range-span" style="left:{_pos(low):.1f}%;width:{max(1.0, _pos(high) - _pos(low)):.1f}%"></span>
+    {marker}
+  </div>
+  <div class="pt-range-scale"><span>${scale_low:,.0f}</span>
+    <span class="pt-range-legend"><i class="pt-legend-marker"></i>最新收盘<i class="pt-legend-span"></i>公开目标价区间</span>
+    <span>${scale_high:,.0f}</span></div>
+</div>"""
+
+    return f'<div class="consensus">{"".join(cells)}</div>{range_html}'
+
+
+def _institution_intelligence(report: dict) -> dict:
+    cached = report.get("institution_intelligence", {}) if isinstance(report, dict) else {}
+    summary = _parse_summary(report)
+    raw_news = ((report.get("raw") or {}).get("news") or []) if isinstance(report, dict) else []
+    url_by_headline = {
+        str(item.get("title") or "").strip(): str(item.get("url") or "").strip()
+        for item in raw_news
+        if isinstance(item, dict) and item.get("title") and item.get("url")
+    }
+    changes = []
+    for raw in summary.get("Rating_Changes", []) or []:
+        if not isinstance(raw, dict):
+            continue
+        item = dict(raw)
+        headline = str(item.get("_Headline") or "").strip()
+        if headline and not item.get("_Source_URL"):
+            item["_Source_URL"] = url_by_headline.get(headline, "")
+        changes.append(item)
+    context = report.get("market_context", {}) if isinstance(report, dict) else {}
+    history = context.get("history", {}) if isinstance(context, dict) else {}
+    if not changes and isinstance(cached, dict) and cached.get("version"):
+        return cached
+    return build_institution_intelligence(
+        changes,
+        history,
+        benchmark="SPY",
+        as_of=_report_generated_at(report),
+        universe=HOT_SYMBOLS,
+    )
 
 
 def _logo_img(symbol: str, css_class: str = "logo") -> str:
@@ -915,19 +1356,28 @@ def _changes_table(changes: list[dict]) -> str:
         return '<p class="empty">最近 30 天公开来源中，尚未记录到该标的的外资评级或目标价变动。</p>'
     rows = []
     for item in changes:
+        action = str(item.get("Action") or "")
+        action_label = ACTION_LABELS.get(action, action.replace("_", " ") or "—")
+        source_url = str(item.get("_Source_URL") or "")
+        source_label = "已验证来源" if item.get("_Source") else "来源待补"
+        source_html = _safe_text(source_label)
+        if source_url.startswith("https://"):
+            source_html = f'<a href="{_safe_attr(source_url)}" rel="noopener noreferrer">{source_html} ↗</a>'
         rows.append(
             "<tr>"
             f'<td>{_safe_text(item.get("Bank") or "—")}</td>'
-            f'<td class="mono">{_safe_text(item.get("Action") or "—")}</td>'
+            f'<td>{_safe_text(action_label)}</td>'
             f'<td>{_safe_text(item.get("Old_Rating") or "—")}</td>'
             f'<td>{_safe_text(item.get("New_Rating") or "—")}</td>'
             f'<td class="mono">{_safe_text(item.get("Price_Target") or "—")}</td>'
             f'<td class="mono">{_safe_text(str(item.get("Time") or "")[:10])}</td>'
+            f'<td>{source_html}</td>'
             "</tr>"
         )
     return (
-        "<table><thead><tr><th>投行</th><th>动作</th><th>原评级</th>"
-        "<th>新评级</th><th>目标价</th><th>日期</th></tr></thead><tbody>"
+        "<table><caption class=\"sr-only\">外资评级与目标价动作</caption>"
+        "<thead><tr><th>投行</th><th>动作</th><th>原评级</th>"
+        "<th>新评级</th><th>目标价</th><th>日期</th><th>证据</th></tr></thead><tbody>"
         + "".join(rows)
         + "</tbody></table>"
     )
@@ -974,6 +1424,89 @@ def _target_panel(targets: list[dict]) -> str:
     return f'<div class="kv">{kv or "<div>目标价</div><div>—</div>"}</div>'
 
 
+def _percent(value: Any, *, signed: bool = True) -> str:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    return f"{number:+.1%}" if signed else f"{number:.0%}"
+
+
+def _reaction_table(events: list[dict], include_institution: bool = True) -> str:
+    if not events:
+        return '<p class="empty">暂无可对齐的关注池事件。</p>'
+    rows = []
+    for event in events[:40]:
+        reaction = event.get("reaction", {}) or {}
+        excess = reaction.get("excess_returns", {}) or {}
+        returns = reaction.get("returns", {}) or {}
+        alignment = str(reaction.get("alignment") or "pending")
+        reaction_class = f"reaction-{alignment}"
+        source_url = str(event.get("source_url") or "")
+        action = _safe_text(event.get("action_label") or event.get("action") or "—")
+        if source_url.startswith("https://"):
+            action = f'<a href="{_safe_attr(source_url)}" rel="noopener noreferrer">{action} ↗</a>'
+        institution_cell = (
+            f'<td><a href="/institutions/{_safe_attr(event.get("institution_slug"))}/">'
+            f'{_safe_text(event.get("institution"))}</a></td>'
+            if include_institution
+            else ""
+        )
+        rows.append(
+            "<tr>"
+            + institution_cell
+            + f'<td><a href="/stocks/{_safe_attr(str(event.get("symbol") or "").lower())}/">{_safe_text(event.get("symbol"))}</a></td>'
+            + f'<td>{action}</td>'
+            + f'<td class="mono">{_safe_text(event.get("price_target") or "—")}</td>'
+            + f'<td class="mono">{_safe_text(_percent(excess.get("1d")))}</td>'
+            + f'<td class="mono">{_safe_text(_percent(excess.get("5d")))}</td>'
+            + f'<td class="mono">{_safe_text(_percent(excess.get("20d")))}</td>'
+            + f'<td class="{reaction_class}">{_safe_text(reaction.get("alignment_label") or "等待验证")}</td>'
+            + f'<td class="mono muted">{_safe_text(event.get("date") or "")}</td>'
+            + "</tr>"
+        )
+    first_heading = "<th>机构</th>" if include_institution else ""
+    table = (
+        '<table class="reaction-table"><thead><tr>'
+        + first_heading
+        + "<th>股票</th><th>公开动作</th><th>目标价</th><th>1D 相对</th><th>5D 相对</th><th>20D 相对</th><th>市场验证</th><th>日期</th>"
+        + "</tr></thead><tbody>"
+        + "".join(rows)
+        + "</tbody></table>"
+    )
+    if len(events) > 40:
+        table += (
+            f'<p class="muted table-note">按日期显示最近 40 条 / 共 {len(events)} 条；'
+            "总样本仍计入上方机构画像与市场验证指标。</p>"
+        )
+    return table
+
+
+def _institution_cards(institutions: list[dict], limit: int = 20) -> str:
+    cards = []
+    for item in institutions[:limit]:
+        tone = str(item.get("tone") or "中性")
+        tone_class = "tone-bull" if tone == "偏多" else "tone-bear" if tone == "偏空" else "tone-mixed"
+        rate = item.get("alignment_rate")
+        cards.append(f"""
+<article class="signal-card">
+  <div class="signal-head">
+    <h2><a href="/institutions/{_safe_attr(item.get('slug'))}/">{_safe_text(item.get('name'))}</a></h2>
+    <span class="tone {tone_class}">公开倾向 · {_safe_text(tone)}</span>
+  </div>
+  <div class="signal-meta">
+    <span>{int(item.get('event_count') or 0)} 条动作</span>
+    <span class="tone-bull">{int(item.get('bullish') or 0)} 偏多</span>
+    <span class="tone-bear">{int(item.get('bearish') or 0)} 偏空</span>
+    <span>方向一致率 {_safe_text(_percent(rate, signed=False) if rate is not None else '待验证')}</span>
+  </div>
+  <p>{_safe_text(item.get('interpretation') or '')}</p>
+  <p class="muted">验证样本 {int(item.get('market_evaluated') or 0)} · 置信度 {_safe_text(item.get('confidence') or '低')} · {_safe_text(item.get('latest_date') or '')}</p>
+</article>
+""")
+    return f'<div class="signal-grid">{"".join(cards)}</div>' if cards else '<p class="empty">暂无机构观点样本。</p>'
+
+
 # ---------------------------------------------------------------------------
 # Page renderers
 # ---------------------------------------------------------------------------
@@ -998,16 +1531,16 @@ def render_stocks_index(report: dict) -> str:
             "</tr>"
         )
     crumb, crumb_schema = _breadcrumb([("首页", "/"), ("股票", "/stocks/")])
-    title = "股票研究库｜AI 算力与半导体关注池 - FResearch"
+    title = "美股投行目标价与评级汇总｜最新研报观点 - FResearch"
     description = (
-        "FResearch 股票库覆盖约 30 只 AI 算力、存储、半导体设备与云平台公司，"
-        "每只股票有独立 URL，汇总外资投行评级与目标价。"
+        "按股票汇总外资投行最新评级、目标价上调或下调、公开研报核心观点及发布后的市场反应，"
+        "覆盖 NVDA、TSM、AVGO、MU 等重点标的。"
     )
     body = f"""
 {crumb}
-<h1>股票研究库</h1>
-<p class="one-liner">一个标的，一个可索引的研究页。先覆盖高质量关注池，不为十万只股票批量生成空文。</p>
-<p class="lede">当前覆盖 AI 算力、HBM/存储、半导体设备、数据中心基础设施和云平台。数据来自公开投行相关来源，页面底部标明方法与披露。</p>
+<h1>股票投行目标价与研报观点</h1>
+<p class="one-liner">按股票查看机构最新评级、目标价动作、公开观点，以及观点后的市场反应。</p>
+<p class="lede">当前只覆盖明确维护的重点股票池。没有外部参照的模型数字不会进入目标价卡；市场验证不足时会明确显示等待样本。</p>
 <div class="panel">
 <table>
 <thead><tr><th>代码</th><th>公司</th><th>赛道</th><th>状态</th></tr></thead>
@@ -1029,13 +1562,19 @@ def render_stock_page(symbol: str, report: dict) -> str:
     if profile is None or symbol not in HOT_SYMBOLS:
         abort(404)
     slice_data = extract_symbol_slice(report, symbol)
+    intelligence = _institution_intelligence(report)
+    symbol_events = [
+        item
+        for item in (intelligence.get("events", []) or [])
+        if isinstance(item, dict) and item.get("symbol") == symbol
+    ]
     path = f"/stocks/{symbol.lower()}/"
     title = (
-        f"{profile['name']}（{symbol}）股票分析｜估值线索、外资评级与 AI 研究 - {SITE_NAME}"
+        f"{profile['name_zh']}（{symbol}）投行目标价与评级｜研报观点及市场反应 - {SITE_NAME}"
     )
     description = (
-        f"FResearch 追踪 {profile['name_zh']}（{symbol}）的外资投行评级、目标价与相关研报。"
-        f"{profile['one_liner']}"
+        f"汇总{profile['name_zh']}（{symbol}）近期投行评级、目标价变动与公开研报观点，"
+        "并追踪观点发布后1、5、20个交易日相对SPY的表现。"
     )
     crumb, crumb_schema = _breadcrumb(
         [("首页", "/"), ("股票", "/stocks/"), (f"{symbol}", path)]
@@ -1046,50 +1585,92 @@ def render_stock_page(symbol: str, report: dict) -> str:
     ]
     if slice_data["changes"]:
         latest = slice_data["changes"][0]
+        latest_action = str(latest.get("Action") or "")
         takeaways.append(
             f"最近公开记录包括 {latest.get('Bank') or '投行'} 对 {symbol} 的 "
-            f"{latest.get('Action') or '评级变动'}（{str(latest.get('Time') or '')[:10] or '日期未标注'}）。"
+            f"{ACTION_LABELS.get(latest_action, latest_action.replace('_', ' ')) or '评级变动'}"
+            f"（{str(latest.get('Time') or '')[:10] or '日期未标注'}）。"
         )
     else:
         takeaways.append(f"最近 30 天账本尚未记录到 {symbol} 的评级变动，页面仍作为长期研究入口保留。")
     related = [t for t in profile.get("related") or [] if t in STOCK_PROFILES]
     topic_links = "".join(
-        f'<a class="chip" href="/topics/{slug}/">{_safe_text(TOPIC_PAGES[slug]["h1"])}</a>'
-        for slug in profile.get("topics") or []
-        if slug in TOPIC_PAGES
+        f'<a class="chip" href="/topics/{slug}/">{_safe_text(RESEARCH_LENS_PAGES[slug]["h1"])}</a>'
+        for slug in ("price-targets", "institution-views", "market-reaction", "institution-signals")
     )
+    institution_groups: dict[str, list[dict]] = {}
+    for event in symbol_events:
+        institution_groups.setdefault(str(event.get("institution_slug") or ""), []).append(event)
+    viewpoint_items = []
+    for slug, events in sorted(
+        institution_groups.items(), key=lambda item: item[1][0].get("date", ""), reverse=True
+    ):
+        latest = events[0]
+        bullish = sum(event.get("stance") == "bullish" for event in events)
+        bearish = sum(event.get("stance") == "bearish" for event in events)
+        tone = "偏多" if bullish > bearish else "偏空" if bearish > bullish else "分歧"
+        evidence = latest.get("headline") or (
+            f"最新公开动作：{latest.get('action_label') or latest.get('action') or '—'}"
+        )
+        # 每条都以「近 30 日公开倾向 X ·」开头会让整页变成同一句话复读，
+        # 对读者和抓取都是噪音；倾向改成徽章，正文只留证据本身。
+        tone_class = {"偏多": "tone-bull", "偏空": "tone-bear"}.get(tone, "tone-mixed")
+        viewpoint_items.append(
+            "<li>"
+            f'<span class="viewpoint-bank">'
+            f'<a href="/institutions/{_safe_attr(slug)}/">{_safe_text(latest.get("institution"))}</a>'
+            f' <span class="tone {tone_class}">{_safe_text(tone)}</span></span>'
+            f'<span class="viewpoint-text">{_safe_text(evidence)}</span>'
+            f'<span class="viewpoint-date">{_safe_text(latest.get("date"))}</span>'
+            "</li>"
+        )
+    viewpoint_html = (
+        f'<ul class="viewpoint-list">{"".join(viewpoint_items)}</ul>'
+        if viewpoint_items
+        else '<p class="empty">最近 30 天暂无可归集的机构观点。</p>'
+    )
+    consensus_html = _consensus_panel(slice_data, symbol)
     generated = slice_data["generated_at"]
     body = f"""
 {crumb}
-<h1>{_logo_img(symbol)}{_safe_text(profile["name_zh"])}（{_safe_text(symbol)}）股票研究</h1>
+<h1>{_logo_img(symbol)}{_safe_text(profile["name_zh"])}（{_safe_text(symbol)}）投行目标价与观点验证</h1>
 <p class="one-liner">{_safe_text(profile["one_liner"])}</p>
 <div class="meta-row">
   <span>交易所：{_safe_text(profile["exchange"])}</span>
   <span>赛道：{_safe_text(profile["sector_zh"])} · {_safe_text(profile["industry"])}</span>
   <span>更新：{_safe_text(generated[:19] or "等待采集")}</span>
 </div>
+{consensus_html}
 <div class="panel">
   <h2>一句话定位</h2>
   <p>{_safe_text(profile["summary"])}</p>
 </div>
 <div class="panel">
-  <h2>Key Takeaways</h2>
-  <ul>{"".join(f"<li>{_safe_text(item)}</li>" for item in takeaways)}</ul>
+  <h2>本页要点</h2>
+  <ul class="source-list">{"".join(f"<li>{_safe_text(item)}</li>" for item in takeaways)}</ul>
 </div>
 <div class="panel">
-  <h2>外资评级与目标价</h2>
+  <h2>机构观点整合</h2>
+  {viewpoint_html}
+</div>
+<div class="table-wrap">
   {_changes_table(slice_data["changes"])}
 </div>
 <div class="panel">
-  <h2>目标价与共识</h2>
+  <h2>目标价口径与共识明细</h2>
   {_target_panel(slice_data["targets"])}
+</div>
+<div class="panel">
+  <h2>观点发布后的市场反应</h2>
+  {_reaction_table(symbol_events)}
+  <div class="evidence-note">相对收益以 SPY 为基准，按事件日期做日线近似。市场未确认不代表机构存在未披露交易行为。</div>
 </div>
 <div class="panel">
   <h2>相关公开标题</h2>
   {_news_list(slice_data["news"])}
 </div>
 <div class="panel">
-  <h2>所属主题</h2>
+  <h2>研究维度</h2>
   <div class="chip-row">{topic_links or '<span class="muted">—</span>'}</div>
   <h2 style="margin-top:18px">相关标的</h2>
   {_stock_chips(related, exclude=symbol)}
@@ -1115,18 +1696,19 @@ def render_stock_page(symbol: str, report: dict) -> str:
 
 def render_topics_index() -> str:
     cards = []
-    for slug, page in TOPIC_PAGES.items():
+    for slug, page in RESEARCH_LENS_PAGES.items():
         cards.append(
             f'<div class="panel"><h2><a href="/topics/{slug}/">{_safe_text(page["h1"])}</a></h2>'
             f'<p>{_safe_text(page["one_liner"])}</p></div>'
         )
-    crumb, crumb_schema = _breadcrumb([("首页", "/"), ("主题", "/topics/")])
-    title = "产业主题研究｜AI、半导体、HBM 与基础设施 - FResearch"
-    description = "FResearch 主题页把股票研究按 AI、半导体、HBM 和基础设施分层，并链回可索引的个股页。"
+    crumb, crumb_schema = _breadcrumb([("首页", "/"), ("分析框架", "/topics/")])
+    title = "投行研报分析框架｜目标价、机构观点与市场验证 - FResearch"
+    description = "FResearch 用四个维度阅读投行研报：目标价与评级动作、机构观点聚合、观点后的市场反应和机构信号一致性。"
     body = f"""
 {crumb}
-<h1>产业主题</h1>
-<p class="one-liner">主题页是活几年的入口，不是一篇过期新闻。</p>
+<h1>投行研报分析框架</h1>
+<p class="one-liner">从“机构说了什么”，一直读到“市场后来是否验证”。</p>
+<p class="lede">原有产业科普不再作为站点主入口；核心研究对象是机构、股票、目标价、时间与后续价格反应。</p>
 {"".join(cards)}
 """
     return render_page(
@@ -1140,11 +1722,11 @@ def render_topics_index() -> str:
 
 
 def render_topic_page(slug: str) -> str:
-    page = TOPIC_PAGES.get(slug)
+    page = RESEARCH_LENS_PAGES.get(slug)
     if not page:
         abort(404)
     path = f"/topics/{slug}/"
-    crumb, crumb_schema = _breadcrumb([("首页", "/"), ("主题", "/topics/"), (page["h1"], path)])
+    crumb, crumb_schema = _breadcrumb([("首页", "/"), ("分析框架", "/topics/"), (page["h1"], path)])
     sections = "".join(
         f'<div class="panel"><h2>{_safe_text(heading)}</h2><p>{_safe_text(text)}</p></div>'
         for heading, text in page["sections"]
@@ -1155,7 +1737,7 @@ def render_topic_page(slug: str) -> str:
 <p class="one-liner">{_safe_text(page["one_liner"])}</p>
 {sections}
 <div class="panel">
-  <h2>覆盖公司</h2>
+  <h2>进入关注股票</h2>
   {_stock_chips(page["stocks"])}
 </div>
 """
@@ -1193,6 +1775,7 @@ def render_learn_index() -> str:
         body,
         [webpage_schema(title, description, "/learn/", "CollectionPage"), crumb_schema],
         "/learn/",
+        robots_directive="noindex,follow",
     )
 
 
@@ -1231,7 +1814,15 @@ def render_learn_page(slug: str) -> str:
     faq = _faq_schema(page)
     if faq:
         schemas.append(faq)
-    return render_page(page["title"] + " | FResearch", page["description"], path, body, schemas, "/learn/")
+    return render_page(
+        page["title"] + " | FResearch",
+        page["description"],
+        path,
+        body,
+        schemas,
+        "/learn/",
+        robots_directive="noindex,follow",
+    )
 
 
 def render_compare_index() -> str:
@@ -1255,6 +1846,7 @@ def render_compare_index() -> str:
         body,
         [webpage_schema(title, description, "/compare/", "CollectionPage"), crumb_schema],
         "/compare/",
+        robots_directive="noindex,follow",
     )
 
 
@@ -1314,7 +1906,153 @@ def render_compare_page(slug: str, report: dict) -> str:
 </div>
 """
     schemas = [article_schema(title, description, path, generated), crumb_schema]
-    return render_page(title, description, path, body, schemas, "/compare/", generated)
+    return render_page(
+        title,
+        description,
+        path,
+        body,
+        schemas,
+        "/compare/",
+        generated,
+        robots_directive="noindex,follow",
+    )
+
+
+def render_institutions_index(report: dict) -> str:
+    intelligence = _institution_intelligence(report)
+    institutions = intelligence.get("institutions", []) or []
+    sentiment = intelligence.get("market_sentiment", {}) or {}
+    coverage = intelligence.get("market_reaction_coverage", {}) or {}
+    generated = _report_generated_at(report)
+    path = "/institutions/"
+    title = "投行观点与目标价记录｜机构情绪及市场验证 - FResearch"
+    description = (
+        "按机构汇总近期股票评级、目标价调整与公开研报观点，比较公开倾向、后续调价和市场反应；"
+        "不推断未披露的交易意图。"
+    )
+    crumb, crumb_schema = _breadcrumb([("首页", "/"), ("机构观点", path)])
+    body = f"""
+{crumb}
+<h1>机构观点、目标价与市场验证</h1>
+<p class="one-liner">把同一机构近期对不同股票的公开动作合并，再看后续市场是否同向。</p>
+<p class="lede">“公开倾向”来自评级与目标价动作；“方向一致率”来自事件后相对 SPY 的日线表现。两者都不能证明机构自营盘或关联资管实体的真实持仓。</p>
+<div class="metric-row">
+  <div class="metric"><b>{len(institutions)}</b><span>有事件机构</span></div>
+  <div class="metric"><b>{int(sentiment.get('event_count') or 0)}</b><span>关注池事件</span></div>
+  <div class="metric"><b>{_safe_text(sentiment.get('label') or '中性')}</b><span>公开信号合计</span></div>
+  <div class="metric"><b>{int(coverage.get('evaluated') or 0)}</b><span>方向性验证样本</span></div>
+</div>
+{_institution_cards(institutions)}
+<div class="panel">
+  <h2>最近公开动作与价格反应</h2>
+  {_reaction_table(intelligence.get('events', []) or [])}
+</div>
+<div class="evidence-note">本页只聚合当前关注股票池内、机构和日期可识别的公开卖方动作。方向一致率样本不足时不做机构排名；同一股票同日多机构动作属于混杂样本。</div>
+"""
+    schemas = [
+        webpage_schema(title, description, path, "CollectionPage"),
+        crumb_schema,
+        organization_schema(),
+    ]
+    return render_page(title, description, path, body, schemas, path, generated)
+
+
+def render_institution_page(slug: str, report: dict) -> str:
+    profile = TRACKED_INSTITUTIONS.get(slug)
+    if not profile:
+        abort(404)
+    intelligence = _institution_intelligence(report)
+    aggregate = next(
+        (item for item in (intelligence.get("institutions", []) or []) if item.get("slug") == slug),
+        None,
+    )
+    events = [
+        item
+        for item in (intelligence.get("events", []) or [])
+        if isinstance(item, dict) and item.get("institution_slug") == slug
+    ]
+    generated = _report_generated_at(report)
+    name = profile["name"]
+    path = f"/institutions/{slug}/"
+    title = f"{name}近期股票观点｜目标价、评级与市场反应 - FResearch"
+    description = (
+        f"查看{name}近30日对关注股票的评级与目标价动作、公开观点摘要及事件后的市场反应；"
+        "不推断未披露交易意图。"
+    )
+    crumb, crumb_schema = _breadcrumb(
+        [("首页", "/"), ("机构观点", "/institutions/"), (name, path)]
+    )
+    if aggregate:
+        alignment = (
+            _percent(aggregate.get("alignment_rate"), signed=False)
+            if aggregate.get("alignment_rate") is not None
+            else "待验证"
+        )
+        metrics = f"""
+<div class="metric-row">
+  <div class="metric"><b>{int(aggregate.get('event_count') or 0)}</b><span>近 30 日动作</span></div>
+  <div class="metric"><b>{_safe_text(aggregate.get('tone') or '中性')}</b><span>公开倾向</span></div>
+  <div class="metric"><b>{_safe_text(alignment)}</b><span>方向一致率</span></div>
+  <div class="metric"><b>{_safe_text(aggregate.get('confidence') or '低')}</b><span>样本置信度</span></div>
+</div>
+<div class="panel"><h2>观点蒸馏</h2><p>{_safe_text(aggregate.get('interpretation') or '')}</p><p class="muted">覆盖股票：{_safe_text('、'.join(aggregate.get('symbols') or []) or '—')}</p></div>
+"""
+    else:
+        metrics = '<div class="panel"><p class="empty">最近 30 天关注池内暂无可验证公开动作。</p></div>'
+    body = f"""
+{crumb}
+<h1>{_safe_text(name)} 近期观点与市场反应</h1>
+<p class="one-liner">{_safe_text(profile['description'])}</p>
+{metrics}
+<div class="panel">
+  <h2>评级、目标价与市场验证</h2>
+  {_reaction_table(events, include_institution=False)}
+</div>
+<div class="evidence-note">卖方研究、交易、投行与资产管理部门可能相互独立。本页分析的是公开表态及其后市场反应，不是对{name}持仓、出货、抄底或主观意图的认定。</div>
+"""
+    schemas = [article_schema(title, description, path, generated), crumb_schema, organization_schema()]
+    return render_page(title, description, path, body, schemas, "/institutions/", generated)
+
+
+def render_reactions_page(report: dict) -> str:
+    intelligence = _institution_intelligence(report)
+    events = intelligence.get("events", []) or []
+    coverage = intelligence.get("market_reaction_coverage", {}) or {}
+    generated = _report_generated_at(report)
+    path = "/reactions/"
+    title = "投行观点市场验证｜评级后1、5、20日股票反应 - FResearch"
+    description = (
+        "追踪投行评级和目标价发布后股票的1、5、20日相对收益，区分市场确认、公开观点未获确认与尚待观察。"
+    )
+    crumb, crumb_schema = _breadcrumb([("首页", "/"), ("市场验证", path)])
+    mature = int(coverage.get("evaluated") or 0)
+    neutral = int(coverage.get("neutral") or 0)
+    pending = int(coverage.get("pending") or 0)
+    body = f"""
+{crumb}
+<h1>投行观点发布后的市场反应</h1>
+<p class="one-liner">观点发布是起点；1、5、20 个交易日后的相对收益才是可观察的验证。</p>
+<div class="metric-row">
+  <div class="metric"><b>{len(events)}</b><span>可识别事件</span></div>
+  <div class="metric"><b>{mature}</b><span>方向性验证样本</span></div>
+  <div class="metric"><b>{neutral} / {pending}</b><span>中性动作 / 等待窗口</span></div>
+  <div class="metric"><b>SPY</b><span>相对收益基准</span></div>
+</div>
+<div class="panel">{_reaction_table(events)}</div>
+<div class="panel">
+  <h2>计算口径</h2>
+  <ul class="source-list">
+    <li>使用复权日线收盘价，从事件前一交易日收盘开始计算。</li>
+    <li>相对表现 = 股票累计收益相对于 SPY 同期累计收益的几何差。</li>
+    <li>公开方向与相对表现同向且幅度至少 1% 才记为市场确认；窗口未成熟显示等待验证。</li>
+    <li>中性重申会展示价格反应，但不强行归入“确认”或“未确认”。</li>
+    <li>事件通常只有日期，无法精确区分盘前与盘后；同日财报或多机构动作可能造成混杂。</li>
+  </ul>
+</div>
+<div class="evidence-note">市场未确认只说明随后价格没有配合公开观点，不能证明机构在出货、抄底或操纵市场。</div>
+"""
+    schemas = [article_schema(title, description, path, generated), crumb_schema, organization_schema()]
+    return render_page(title, description, path, body, schemas, path, generated)
 
 
 def _trust_body(slug: str) -> tuple[str, str, str, str]:
@@ -1323,19 +2061,19 @@ def _trust_body(slug: str) -> tuple[str, str, str, str]:
     pages = {
         "about": (
             "关于 FResearch",
-            "FResearch 是面向投资者的 AI 金融研究平台，追踪外资投行对 AI 算力与半导体主线的评级与目标价。",
+            "FResearch 聚合外资投行股票评级、目标价与公开研报观点，并追踪观点发布后的市场反应。",
             "FResearch 是什么？",
             f"""
-<p class="one-liner">FResearch 把公开的外资投行研报信息，整理成可检索、可引用、带来源分级的研究页。</p>
+<p class="one-liner">FResearch 把公开的投行目标价、评级与研报观点，整理成可追溯、可验证的股票与机构研究页。</p>
 <div class="panel">
   <h2>谁</h2>
   <p>FResearch（Fresearch）是独立研究整理站点，运营者公开联系方式为 {CONTACT_EMAIL}，社交账号 {X_HANDLE}。</p>
   <h2>是什么</h2>
-  <p>AI 辅助的金融研究引擎：聚合投行评级变动、目标价和相关新闻标题，再用模型做结构化摘要。</p>
+  <p>投行观点验证引擎：聚合评级变动、目标价与公开研报标题，再把每次公开动作和其后 1、5、20 个交易日的市场反应对齐。</p>
   <h2>服务谁</h2>
-  <p>需要跟踪 NVDA、TSM、AVGO 等 AI 算力链、又不想把未验证数字当成事实的投资者与研究者。</p>
+  <p>需要跟踪 NVDA、TSM、AVGO 等重点股票的机构目标价、观点分歧与后续市场验证的投资者和研究者。</p>
   <h2>解决什么</h2>
-  <p>把分散在 Finnhub、Yahoo、Google News 等来源中的 upgrade / downgrade / price target 事件，变成带时间戳的公开页面。</p>
+  <p>把分散的 upgrade / downgrade / price target 事件变成按股票、机构和时间归集的公开记录，并明确区分事实、摘要与市场验证。</p>
 </div>
 <div class="panel">
   <h2>当前覆盖</h2>
@@ -1357,7 +2095,11 @@ def _trust_body(slug: str) -> tuple[str, str, str, str]:
   <h2>去重</h2>
   <p>评级事件按 (bank, symbol, action, date) 写入 30 天滚动账本，避免同一条升级在不同转载源重复计数。</p>
   <h2>目标价分级</h2>
-  <p>av_consensus（Alpha Vantage 一致预期）优先于 verified_headline（标题正则、无 LLM），再才是 llm_inferred（模型提取且通过交叉验证）。未验证数字不作为事实展示。</p>
+  <p>av_consensus（Alpha Vantage 一致预期）与 verified_headline / verified_summary（公开标题或摘要正则）可进入展示。模型提取的数字只作为候选，没有外部参照时不进入目标价卡。</p>
+  <h2>市场验证</h2>
+  <p>使用复权日线，从事件前一交易日收盘起计算 1、5、20 个交易日收益，并与 SPY 同期收益比较。窗口未成熟显示等待验证。</p>
+  <h2>机构信号</h2>
+  <p>公开评级和目标价动作可用于描述“公开倾向”，但不能证明机构持仓或交易意图。卖方研究、交易、投行与资管部门可能相互独立。</p>
   <h2>为什么不用十万只股票程序化文章</h2>
   <p>金融内容属于 YMYL。FResearch 只为关注池内公司建立实体页，并要求页面能展示真实跟踪状态。这是为了避免无新增价值的规模化内容。</p>
 </div>
@@ -1428,6 +2170,8 @@ def _trust_body(slug: str) -> tuple[str, str, str, str]:
 <div class="panel">
   <p>FResearch 是研究与信息软件平台，不提供投资顾问、经纪、资产管理或交易执行服务。平台信息仅供研究与教育用途，不构成投资建议、要约或招揽。</p>
   <p>评级、目标价和新闻标题来自第三方公开来源，可能延迟、不完整或被转载扭曲。过去的目标价不保证未来价格。</p>
+  <p>“市场确认 / 未确认”仅描述公开观点与后续价格表现是否同向，不构成对机构出货、抄底、操纵或任何未披露交易意图的认定。</p>
+  <p>机构的研究、交易、投行与资产管理部门可能相互独立；公开评级不能证明其持仓方向。若未来引用持仓披露，也会明确标注法律实体、披露日期与时滞。</p>
   <p>站点维护者可能持有或不持有文中提及的证券。页面中的打赏链接用于服务器与数据成本，不解锁“更准的投资建议”。</p>
 </div>
 """,
@@ -1440,7 +2184,7 @@ def _trust_body(slug: str) -> tuple[str, str, str, str]:
 <p class="one-liner">FResearch 是 AI 辅助的外资投行研报跟踪器，不是荐股机器人。</p>
 <div class="panel">
   <h2>产品</h2>
-  <p>跟踪 { _safe_text(symbols) } 等标的的外资评级与目标价，生成可引用的中文研究页。</p>
+  <p>跟踪 { _safe_text(symbols) } 等标的的外资评级、目标价、公开观点和事件后市场反应，生成可引用的中文研究页。</p>
   <h2>用户</h2>
   <p>需要把公开卖方研究整理成结构化事实的投资者、分析师和对 AI 引用源有要求的读者。</p>
   <h2>数据</h2>
@@ -1548,45 +2292,58 @@ Sitemap: {origin}/sitemap.xml
 """
 
 
+def _has_indexable_substance(report: dict, symbol: str) -> bool:
+    """判断股票页是否有超出模板文案的实质内容。"""
+    slice_data = extract_symbol_slice(report, symbol)
+    return bool(
+        slice_data.get("changes")
+        or slice_data.get("targets")
+        or slice_data.get("news")
+    )
+
+
 def sitemap_xml(report: Optional[dict] = None) -> str:
     report = report if report is not None else get_latest_report()
-    lastmod = _iso_date(_report_generated_at(report) or CONTENT_PUBLISHED)
-    urls: list[tuple[str, str, str]] = [
-        ("/", "daily", "1.0"),
-        ("/stocks/", "daily", "0.9"),
-        ("/topics/", "weekly", "0.8"),
-        ("/learn/", "weekly", "0.7"),
-        ("/compare/", "weekly", "0.6"),
-        ("/about/", "monthly", "0.6"),
-        ("/methodology/", "monthly", "0.6"),
-        ("/ai-methodology/", "monthly", "0.5"),
-        ("/sources/", "monthly", "0.6"),
-        ("/editorial-policy/", "monthly", "0.4"),
-        ("/disclosures/", "monthly", "0.4"),
-        ("/ai-info/", "monthly", "0.5"),
-        ("/authors/xie-shangchao/", "monthly", "0.4"),
+    dynamic_lastmod = _iso_date(_report_generated_at(report) or CONTENT_PUBLISHED)
+    static_lastmod = CONTENT_PUBLISHED
+    urls: list[tuple[str, str]] = [
+        ("/", dynamic_lastmod),
+        ("/stocks/", dynamic_lastmod),
+        ("/institutions/", dynamic_lastmod),
+        ("/reactions/", dynamic_lastmod),
+        ("/topics/", static_lastmod),
+        ("/about/", static_lastmod),
+        ("/methodology/", static_lastmod),
+        ("/ai-methodology/", static_lastmod),
+        ("/sources/", static_lastmod),
+        ("/editorial-policy/", static_lastmod),
+        ("/disclosures/", static_lastmod),
+        ("/ai-info/", static_lastmod),
+        ("/authors/xie-shangchao/", static_lastmod),
     ]
+    # 没有任何评级事件也没有目标价的股票页只剩下模板文案。这些页仍然可访问、
+    # 仍然被站内链接指向，但不提交进 sitemap，避免把抓取预算花在空壳实体页上。
     for ticker in HOT_SYMBOLS:
-        urls.append((f"/stocks/{ticker.lower()}/", "daily", "0.8"))
-    for slug in TOPIC_PAGES:
-        urls.append((f"/topics/{slug}/", "weekly", "0.7"))
-    for slug in LEARN_PAGES:
-        urls.append((f"/learn/{slug}/", "monthly", "0.6"))
-    for slug in COMPARE_PAGES:
-        urls.append((f"/compare/{slug}/", "weekly", "0.6"))
+        if _has_indexable_substance(report, ticker):
+            urls.append((f"/stocks/{ticker.lower()}/", dynamic_lastmod))
+    for slug in RESEARCH_LENS_PAGES:
+        urls.append((f"/topics/{slug}/", static_lastmod))
+    intelligence = _institution_intelligence(report)
+    for item in intelligence.get("institutions", []) or []:
+        slug = str(item.get("slug") or "") if isinstance(item, dict) else ""
+        if slug in TRACKED_INSTITUTIONS:
+            urls.append((f"/institutions/{slug}/", dynamic_lastmod))
 
     chunks = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">',
     ]
-    for path, freq, priority in urls:
+    for path, lastmod in urls:
         loc = xml_escape(_abs(path))
         chunks.append(
             "<url>"
             f"<loc>{loc}</loc>"
             f"<lastmod>{lastmod}</lastmod>"
-            f"<changefreq>{freq}</changefreq>"
-            f"<priority>{priority}</priority>"
             "</url>"
         )
     chunks.append("</urlset>")
@@ -1602,15 +2359,16 @@ def llms_txt() -> str:
     )
     return f"""# {SITE_NAME}
 
-> {SITE_NAME} is an AI-assisted financial research site that tracks foreign investment-bank rating changes, price targets and related headlines for an AI compute / semiconductor coverage universe. It is not an investment adviser.
+> {SITE_NAME} tracks public investment-bank ratings, price targets and research views, then compares each dated call with the stock's later 1/5/20-session return versus SPY. It is not an investment adviser.
 
 The canonical site is {origin}/. Public pages are server-rendered HTML.
 
 ## Core facts
-- Product: foreign IB research tracker + stock entity pages
-- Users: investors and researchers following NVDA, TSM, AVGO and related AI infrastructure names
+- Product: sell-side price-target tracker + institution-view aggregation + post-call market reaction
+- Users: investors and researchers tracking investment-bank targets, public research views and post-call market confirmation
 - Data: public sources (Finnhub, Yahoo Finance, Google News RSS, Alpha Vantage), deduped into a 30-day ledger
 - AI: used for structured summaries only; unverified model numbers are not treated as facts
+- Boundary: public calls and later prices cannot prove an institution's holdings or trading intent
 - Language: Simplified Chinese UI, English tickers
 
 ## Do not confuse FResearch with
@@ -1627,12 +2385,14 @@ The canonical site is {origin}/. Public pages are server-rendered HTML.
 - [Sources]({origin}/sources/)
 - [Disclosures]({origin}/disclosures/)
 - [Stock index]({origin}/stocks/)
+- [Institution views]({origin}/institutions/)
+- [Market reactions]({origin}/reactions/)
 
-## Topics
-- [AI]({origin}/topics/ai/)
-- [Semiconductors]({origin}/topics/semiconductors/)
-- [HBM / memory]({origin}/topics/hbm/)
-- [AI infrastructure]({origin}/topics/ai-infrastructure/)
+## Research lenses
+- [Price targets and rating actions]({origin}/topics/price-targets/)
+- [Institution view aggregation]({origin}/topics/institution-views/)
+- [Post-call market reaction]({origin}/topics/market-reaction/)
+- [Institution signal consistency]({origin}/topics/institution-signals/)
 
 ## Coverage universe
 {stock_lines}
@@ -1649,12 +2409,16 @@ def _text_response(body: str, mimetype: str, max_age: int = 300) -> Response:
     return response
 
 
-def _html_response(html: str) -> Response:
+def _html_response(html: str, *, indexable: bool = True) -> Response:
     response = Response(html, mimetype="text/html")
     response.headers["Cache-Control"] = (
         "public, max-age=120, s-maxage=300, stale-while-revalidate=1800"
     )
-    response.headers["X-Robots-Tag"] = "index, follow, max-image-preview:large, max-snippet:-1"
+    response.headers["X-Robots-Tag"] = (
+        "index, follow, max-image-preview:large, max-snippet:-1"
+        if indexable
+        else "noindex, follow"
+    )
     return response
 
 
@@ -1672,54 +2436,68 @@ def register_geo_routes(app) -> None:
         return _text_response(llms_txt(), "text/plain; charset=utf-8", max_age=600)
 
     @app.route("/stocks/")
-    @app.route("/stocks")
     def stocks_index():
         return _html_response(render_stocks_index(get_latest_report()))
 
     @app.route("/stocks/<symbol>/")
-    @app.route("/stocks/<symbol>")
     def stock_page(symbol: str):
         return _html_response(render_stock_page(symbol, get_latest_report()))
 
     @app.route("/topics/")
-    @app.route("/topics")
     def topics_index():
         return _html_response(render_topics_index())
 
     @app.route("/topics/<slug>/")
-    @app.route("/topics/<slug>")
     def topic_page(slug: str):
+        legacy_targets = {
+            "ai": "/topics/institution-views/",
+            "semiconductors": "/topics/price-targets/",
+            "hbm": "/topics/market-reaction/",
+            "ai-infrastructure": "/topics/institution-signals/",
+        }
+        if slug in legacy_targets:
+            return redirect(legacy_targets[slug], code=308)
         return _html_response(render_topic_page(slug))
 
+    @app.route("/institutions/")
+    def institutions_index():
+        return _html_response(render_institutions_index(get_latest_report()))
+
+    @app.route("/institutions/<slug>/")
+    def institution_page(slug: str):
+        return _html_response(render_institution_page(slug, get_latest_report()))
+
+    @app.route("/reactions/")
+    def reactions_page():
+        return _html_response(render_reactions_page(get_latest_report()))
+
     @app.route("/learn/")
-    @app.route("/learn")
     def learn_index():
-        return _html_response(render_learn_index())
+        return redirect("/methodology/", code=308)
 
     @app.route("/learn/<slug>/")
-    @app.route("/learn/<slug>")
     def learn_page(slug: str):
-        return _html_response(render_learn_page(slug))
+        target = (
+            "/topics/price-targets/"
+            if slug in {"price-target", "analyst-rating", "earnings-revision"}
+            else "/methodology/"
+        )
+        return redirect(target, code=308)
 
     @app.route("/compare/")
-    @app.route("/compare")
     def compare_index():
-        return _html_response(render_compare_index())
+        return redirect("/stocks/", code=308)
 
     @app.route("/compare/<slug>/")
-    @app.route("/compare/<slug>")
     def compare_page(slug: str):
-        return _html_response(render_compare_page(slug, get_latest_report()))
+        return redirect("/stocks/", code=308)
 
     @app.route("/authors/xie-shangchao/")
-    @app.route("/authors/xie-shangchao")
     @app.route("/authors/")
-    @app.route("/authors")
     def authors_page():
         return _html_response(render_authors_page())
 
     @app.route("/<slug>/")
-    @app.route("/<slug>")
     def trust_page(slug: str):
         if slug not in TRUST_PAGES:
             abort(404)

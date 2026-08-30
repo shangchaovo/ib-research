@@ -38,6 +38,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional, Tuple, Callable
 
+from institution_intelligence import build_institution_intelligence, classify_stance
+
 # Qwen fallback（阿里云百炼，国内直连）
 sys.path.insert(0, os.path.expanduser("~/.openclaw/workspace/scripts"))
 try:
@@ -560,6 +562,26 @@ def fetch_yahoo_enrichment(symbols: List[str]) -> Dict[str, Dict]:
     return out
 
 
+def fetch_market_history(symbols: List[str], benchmark: str = "SPY") -> Dict[str, List[Dict]]:
+    """批量获取关注池日线，用于验证评级/目标价后的真实价格反应。"""
+    try:
+        from collectors.yahoo_provider import YahooProvider
+    except Exception as exc:
+        print(f"     [WARN] Yahoo 市场反应数据层不可用: {exc}")
+        return {}
+    requested = list(dict.fromkeys(
+        [str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()]
+        + [benchmark]
+    ))
+    try:
+        history = YahooProvider().market_history(requested, period="3mo")
+    except Exception as exc:
+        print(f"     [WARN] Yahoo 市场反应数据获取失败: {type(exc).__name__}: {exc}")
+        return {}
+    print(f"     市场反应日线: {len(history)}/{len(requested)} 只")
+    return history
+
+
 def _fetch_single_news(sym: str, from_date: str, to_date: str, seen_urls: set) -> List[Dict]:
     """获取单只股票的新闻（用于并行）"""
     finnhub_limiter.acquire()
@@ -961,6 +983,7 @@ def _extract_verified_rating_events(news: List[Dict]) -> List[Dict]:
             "Time": datetime.strptime(event_date, "%Y%m%d").strftime("%Y-%m-%d"),
             "_Source": "verified_headline",
             "_Headline": title,
+            "_Source_URL": item.get("url") or "",
         }
         if old_pt:
             event["_Old_Price_Target"] = f"${old_pt}"
@@ -1080,6 +1103,8 @@ def _extract_pt_events_from_summaries(news: List[Dict]) -> List[Dict]:
                 "Price_Target": f"${new_pt}",
                 "Time": datetime.strptime(event_date, "%Y%m%d").strftime("%Y-%m-%d"),
                 "_Source": "verified_summary",
+                "_Headline": title,
+                "_Source_URL": item.get("url") or "",
             }
             if old_pt:
                 event["_Old_Price_Target"] = f"${old_pt}"
@@ -1494,46 +1519,27 @@ def _build_verified_asset_targets(
     优先级：
     1. AV 官方共识目标价（_Source="av_consensus"）
     2. 正则提取的最新投行目标价（_Source="verified_headline"）
-    3. LLM 目标价仅在能与时价/共识交叉验证（≤2x）时保留（_Source="llm_inferred"）
+
+    LLM 目标价只用于漂移质检，不直接进入目标价卡片。
     """
     # 每只股票取最新一条 verified headline 事件
     verified_by_symbol: Dict[str, Dict] = {}
     for event in sorted(verified_events, key=lambda e: str(e.get("Time", "")), reverse=True):
-        if event.get("Price_Target"):
-            verified_by_symbol.setdefault(event["Symbol"], event)
-
-    current_price_by_symbol: Dict[str, Optional[float]] = {}
-    for sym, ov in overviews.items():
-        current_price_by_symbol[sym] = _parse_price(ov.get("analyst_target_price"))
+        symbol = str(event.get("Symbol") or "").strip().upper()
+        if symbol in HOT_SYMBOLS and event.get("Price_Target"):
+            verified_by_symbol.setdefault(symbol, event)
 
     merged: Dict[str, Dict] = {}
     for item in llm_targets or []:
         if not isinstance(item, dict):
             continue
         sym = str(item.get("Asset") or "").strip().upper()
-        if not sym:
+        if not sym or sym not in HOT_SYMBOLS:
             continue
-        llm_price = _parse_price(item.get("Target_Price"))
         overview = overviews.get(sym)
         consensus_price = _parse_price((overview or {}).get("analyst_target_price"))
         verified_event = verified_by_symbol.get(sym)
         verified_price = _parse_price((verified_event or {}).get("Price_Target"))
-
-        # 交叉验证：LLM 价格与共识/已验证价格偏差超过 2x 视为幻觉，丢弃
-        reference_price = consensus_price or verified_price
-        llm_plausible = (
-            llm_price is not None
-            and (reference_price is None or 0.5 <= llm_price / reference_price <= 2.0)
-        )
-
-        # LLM 推断的卡片要求当日原始新闻里确实提到该股票，防止历史幻觉沉淀
-        sym_mentioned = True
-        if news:
-            sym_mentioned = any(
-                sym in f"{n.get('title','')} {n.get('summary','')}"
-                or any(str(t.get("ticker", "")).upper() == sym for t in (n.get("tickers") or []) if isinstance(t, dict))
-                for n in news
-            )
 
         target = {
             "Asset": sym,
@@ -1553,9 +1559,6 @@ def _build_verified_asset_targets(
         elif verified_price is not None:
             target["Target_Price"] = f"${verified_price:g}"
             target["_Source"] = "verified_headline"
-        elif llm_plausible and sym_mentioned and llm_price is not None:
-            target["Target_Price"] = f"${llm_price:g}"
-            target["_Source"] = "llm_inferred"
 
         if verified_event is not None:
             target["_Verified_PT"] = verified_event.get("Price_Target")
@@ -2147,15 +2150,9 @@ def _analyze_trends(reports: List[Dict]) -> Dict[str, Any]:
     bank_sentiment: Dict[str, Dict[str, int]] = {}
     for c in all_changes:
         bank = _canonical_bank_name(c.get("Bank")) or "Unknown"
-        action = c.get("Action", "").lower()
         if bank not in bank_sentiment:
             bank_sentiment[bank] = {"bullish": 0, "bearish": 0, "neutral": 0}
-        if action in ("upgrade", "initiat"):
-            bank_sentiment[bank]["bullish"] += 1
-        elif action in ("downgrade",):
-            bank_sentiment[bank]["bearish"] += 1
-        else:
-            bank_sentiment[bank]["neutral"] += 1
+        bank_sentiment[bank][classify_stance(c)] += 1
 
     return {
         "analysis_period_days": len(reports),
@@ -2552,7 +2549,10 @@ def _merge_rating_changes(existing: List[Dict], new_changes: List[Dict]) -> List
 
         merged = dict(current)
         merged["Bank"] = _preferred_bank_name(current.get("Bank"), event.get("Bank"))
-        for field in ("Symbol", "Action", "New_Rating", "Old_Rating", "Price_Target", "Time"):
+        for field in (
+            "Symbol", "Action", "New_Rating", "Old_Rating", "Price_Target", "Time",
+            "_Old_Price_Target", "_Source", "_Headline", "_Source_URL",
+        ):
             if _clean_field(event.get(field)):
                 merged[field] = event[field]
         first_seen = [
@@ -4268,11 +4268,62 @@ def run_fetch(force: bool = False, fast: bool = False) -> Dict[str, Any]:
         else:
             print("     无显著变化")
 
-    data_sources = [
-        "finnhub", "alpha_vantage", "seeking_alpha", "reddit", "google_news",
-        "yahoo_finance", "benzinga", "barrons", "marketwatch", "zacks", "streetinsider",
-        "semianalysis",
-    ]
+    # 将公开评级/目标价与之后的真实价格反应对齐。这里只分析关注池，避免把
+    # 扩展 RSS 中偶然出现、但没有稳定股票实体页的代码混入机构画像。
+    print("  -> 对齐机构观点与市场反应...")
+    reaction_symbols = sorted({
+        str(event.get("Symbol") or "").strip().upper()
+        for event in rating_ledger
+        if isinstance(event, dict)
+        and str(event.get("Symbol") or "").strip().upper() in HOT_SYMBOLS
+    })
+    market_history = fetch_market_history(reaction_symbols, benchmark="SPY")
+    previous_market_context = (
+        (prev_report or {}).get("market_context", {})
+        if isinstance(prev_report, dict)
+        else {}
+    )
+    if not market_history and isinstance(previous_market_context, dict):
+        cached_history = previous_market_context.get("history")
+        if isinstance(cached_history, dict):
+            market_history = cached_history
+            print("     Yahoo 日线暂不可用，复用上次市场反应样本")
+    previous_market_fetched_at = (
+        str(previous_market_context.get("fetched_at") or "")
+        if isinstance(previous_market_context, dict)
+        else ""
+    )
+    market_context = {
+        "benchmark": "SPY",
+        "fetched_at": now.isoformat() if market_history else previous_market_fetched_at,
+        "history": market_history,
+    }
+    institution_intelligence = build_institution_intelligence(
+        rating_ledger,
+        market_history,
+        benchmark="SPY",
+        as_of=now.isoformat(),
+        universe=HOT_SYMBOLS,
+    )
+    print(
+        "     机构画像: "
+        f"{len(institution_intelligence.get('institutions', []))} 家 / "
+        f"{institution_intelligence.get('market_sentiment', {}).get('event_count', 0)} 条关注池事件"
+    )
+
+    # 只声明本轮报告里确实留下证据的数据类别，不把“配置过但抓取失败”的
+    # 站点算成已覆盖来源。
+    data_sources = []
+    if recommendations:
+        data_sources.append("finnhub_recommendations")
+    if news:
+        data_sources.append("public_news_rss")
+    if av_overviews:
+        data_sources.append("alpha_vantage_consensus")
+    if market_history:
+        data_sources.append("yahoo_finance_market_history")
+    if reddit_posts:
+        data_sources.append("reddit_public_posts")
 
     if "error" in summary or summary.get("_fallback"):
         analysis_status = "degraded"
@@ -4309,6 +4360,8 @@ def run_fetch(force: bool = False, fast: bool = False) -> Dict[str, Any]:
         "summary": summary,
         "trends": trends,
         "change_analysis": change_analysis,
+        "institution_intelligence": institution_intelligence,
+        "market_context": market_context,
         "reddit_summary": reddit_summary,
         "raw": {
             "fetch_time": now.isoformat(),

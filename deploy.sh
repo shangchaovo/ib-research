@@ -20,30 +20,45 @@ FILES=(
   ib_research_health.py
   ib_research_cron_runner.py
   ib_research_seo_monitor.py
+  design_system.py
+  institution_intelligence.py
   llm_fallback.py
+  collectors/__init__.py
+  collectors/yahoo_provider.py
   test_ib_research_geo.py
+  test_institution_intelligence.py
   og-image.png
 )
 
 echo "==> 部署 ib-research: $SRC -> $DST"
 for f in "${FILES[@]}"; do
+  mkdir -p "$(dirname "$DST/$f")"
   cp "$SRC/$f" "$DST/$f"
   echo "    synced $f"
 done
 
 echo "==> 语法校验(避免坏代码上线)"
-"$PY" -m py_compile "$DST"/ib_research_server.py "$DST"/ib_research_fetcher.py "$DST"/ib_research_geo.py
+"$PY" -m py_compile \
+  "$DST"/ib_research_server.py \
+  "$DST"/ib_research_fetcher.py \
+  "$DST"/ib_research_geo.py \
+  "$DST"/design_system.py \
+  "$DST"/institution_intelligence.py \
+  "$DST"/collectors/yahoo_provider.py
 
-echo "==> geo 单测"
-( cd "$DST" && "$PY" -m unittest test_ib_research_geo >/dev/null && echo "    8 tests OK" )
+echo "==> 页面与机构分析单测"
+( cd "$DST" && "$PY" -m unittest test_ib_research_geo test_institution_intelligence )
 
 echo "==> 重启 com.openclaw.ib-research-server"
 launchctl kickstart -k "gui/$(id -u)/com.openclaw.ib-research-server"
 
 echo "==> 冒烟: 等待 8081 就绪并检查 GSC 验证 meta"
 ok=""
-for _ in $(seq 1 20); do
-  if curl -s --max-time 5 http://127.0.0.1:8081/ | grep -q 'google-site-verification'; then
+smoke_file="$(mktemp)"
+trap 'rm -f "$smoke_file"' EXIT
+for _ in $(seq 1 45); do
+  if curl -fsS --max-time 5 -o "$smoke_file" http://127.0.0.1:8081/ \
+    && grep -q 'google-site-verification' "$smoke_file"; then
     ok=1
     break
   fi
@@ -52,6 +67,6 @@ done
 if [ -n "$ok" ]; then
   echo "    OK: 8081 首页已带验证 meta"
 else
-  echo "    WARN: 20s 内未在 8081 首页发现验证 meta,请查日志" >&2
+  echo "    WARN: 45s 内未在 8081 首页发现验证 meta,请查日志" >&2
 fi
 echo "==> 完成"

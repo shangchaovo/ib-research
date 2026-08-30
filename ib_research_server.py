@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import ipaddress
 import json
+import math
 import os
 import re
 import sys
@@ -32,7 +33,9 @@ from flask import Flask, jsonify, Response, request
 
 # 将workspace加入路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from design_system import PAGE_CSS
 from ib_research_fetcher import run_fetch, get_latest_report, CACHE_DIR, FINNHUB_TOKEN, HOT_SYMBOLS
+from institution_intelligence import build_institution_intelligence
 from ib_research_geo import (
     homepage_footer_nav_html,
     homepage_head_html,
@@ -347,6 +350,29 @@ def _safe_multiline(value) -> str:
     return _safe_text(value).replace("\n", "<br>")
 
 
+def _paragraphed(value, sentences_per_para: int = 2) -> str:
+    """把 LLM 生成的长中文摘要按句切成段落。
+
+    模型经常一口气吐出七八句不换行的正文，直接渲染就是一整面文字墙。
+    这里按句号/问号/感叹号断句后每两句成段，保留原有的显式换行。
+    """
+    text = str(value if value is not None else "").strip()
+    if not text:
+        return ""
+    blocks = []
+    for raw_block in re.split(r"\n+", text):
+        block = raw_block.strip()
+        if not block:
+            continue
+        sentences = [s for s in re.split(r"(?<=[。！？!?])\s*", block) if s.strip()]
+        if len(sentences) <= sentences_per_para:
+            blocks.append(block)
+            continue
+        for start in range(0, len(sentences), sentences_per_para):
+            blocks.append("".join(sentences[start:start + sentences_per_para]))
+    return "".join(f"<p>{_safe_text(block)}</p>" for block in blocks)
+
+
 def _normalize_logo_symbol(symbol: str) -> str:
     """把外部 ticker 收敛为可安全请求的 Parqet symbol。"""
     normalized = str(symbol or "").strip().upper().replace(".", "-").replace("/", "-")
@@ -634,6 +660,295 @@ def logo_asset(symbol: str):
     return response.make_conditional(request)
 
 
+RATING_PAGE_SIZE = 30
+RATING_WINDOWS = (7, 14, 30)
+
+_ACTION_DISPLAY = {
+    "upgrade": "上调评级",
+    "downgrade": "下调评级",
+    "initiate": "首次覆盖",
+    "reiterate": "重申评级",
+    "price_target_raise": "上调目标价",
+    "price_target_cut": "下调目标价",
+}
+
+
+def _rating_date(value) -> str:
+    """将评级时间归一化为可排序、可筛选的 YYYY-MM-DD。"""
+    raw_value = str(value or "").strip()
+    match = re.search(r"\d{4}-\d{2}-\d{2}", raw_value)
+    if match:
+        return match.group(0)
+    for fmt in ("%Y/%m/%d", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(raw_value[:10], fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return ""
+
+
+def _rating_event_key(detail: dict) -> tuple:
+    event_date = _rating_date(detail.get("Time")) or _rating_date(detail.get("_First_Seen"))
+    return (
+        str(detail.get("Bank", "")).strip().casefold(),
+        str(detail.get("Symbol", "")).strip().upper(),
+        str(detail.get("Action", "")).strip().casefold(),
+        event_date,
+    )
+
+
+def _rating_badge(rating: str) -> str:
+    if not rating:
+        return '<span class="tag tag-empty" title="来源未公布此项，并非抓取失败">—</span>'
+    r = rating.lower()
+    safe_rating = _safe_text(rating)
+    if any(k in r for k in ("buy", "overweight", "outperform", "strong buy")):
+        return f'<span class="tag tag-bull">{safe_rating}</span>'
+    if any(k in r for k in ("sell", "underweight", "underperform")):
+        return f'<span class="tag tag-bear">{safe_rating}</span>'
+    if any(k in r for k in ("hold", "neutral", "equal", "market")):
+        return f'<span class="tag tag-neutral">{safe_rating}</span>'
+    return f'<span class="tag">{safe_rating}</span>'
+
+
+def _action_dot(action: str) -> str:
+    """方向色点：升级/上调为多，降级/下调为空，其余为持平或首次覆盖。"""
+    if not action:
+        return '<span class="action-dot action-flat"></span>'
+    a = action.lower()
+    if "raise" in a or "upgrade" in a:
+        return '<span class="action-dot action-up"></span>'
+    if "cut" in a or "downgrade" in a or "lower" in a:
+        return '<span class="action-dot action-down"></span>'
+    if "initiate" in a or "new" in a:
+        return '<span class="action-dot action-new"></span>'
+    return '<span class="action-dot action-flat"></span>'
+
+
+def _action_display(action: str) -> str:
+    return _ACTION_DISPLAY.get(action.lower(), action.replace("_", " ").title())
+
+
+def _logo_url(symbol: str) -> str:
+    normalized = _normalize_logo_symbol(symbol)
+    if not normalized or symbol == "—":
+        return ""
+    return f'/assets/logos/{quote(normalized, safe="-")}.svg?v=2'
+
+
+def _logo_html(symbol: str, size: str = "row") -> str:
+    url = _logo_url(symbol)
+    if not url:
+        return ""
+    normalized = _normalize_logo_symbol(symbol)
+    safe_url = _safe_attr(url)
+    safe_symbol = _safe_attr(symbol)
+    safe_initial = _safe_text(symbol[0] if symbol else "?")
+    pending_attr = (
+        ' data-logo-pending="1"'
+        if _read_cached_logo(normalized) is None
+        else ""
+    )
+    if size == "row":
+        return (
+            '<span class="logo-wrap row-logo-wrap">'
+            f'<img class="row-logo" src="{safe_url}" alt="" loading="lazy"{pending_attr}'
+            ' onerror="this.style.display=\'none\'; this.nextElementSibling.style.display=\'flex\';">'
+            f'<span class="row-logo-fallback">{safe_initial}</span>'
+            '</span>'
+        )
+    return f'''<div class="logo-wrap asset-logo-wrap">
+                <img class="asset-logo" src="{safe_url}" alt="{safe_symbol}" loading="lazy"{pending_attr} onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
+                <div class="asset-logo-fallback">{safe_initial}</div>
+            </div>'''
+
+
+def _build_rating_ledger(report: dict) -> list[dict]:
+    """把 30 天评级账本整理成按事件日倒序的扁平列表。
+
+    表格以 summary.Rating_Changes 为唯一事实源，change_analysis 只补充优先级。
+    """
+    summary = report.get("summary", {})
+    if isinstance(summary, str):
+        try:
+            summary = json.loads(summary)
+        except Exception:
+            summary = {}
+
+    raw = report.get("raw", {}) or {}
+    source_url_by_headline = {
+        str(item.get("title") or "").strip(): str(item.get("url") or "").strip()
+        for item in (raw.get("news", []) or [])
+        if isinstance(item, dict) and item.get("title") and item.get("url")
+    }
+
+    change_analysis = report.get("change_analysis", {}) or {}
+    analyzed_changes = list(change_analysis.get("changes", []) or [])
+    if not isinstance(summary, dict):
+        ledger = [ch for ch in analyzed_changes if isinstance(ch, dict)]
+    else:
+        priority_by_key = {
+            _rating_event_key(ch.get("detail", {}) or {}): ch.get("priority", "normal")
+            for ch in analyzed_changes
+            if isinstance(ch, dict)
+        }
+        ledger = []
+        for event in (summary.get("Rating_Changes", []) or []):
+            if not isinstance(event, dict):
+                continue
+            detail = dict(event)
+            headline = str(detail.get("_Headline") or "").strip()
+            if headline and not detail.get("_Source_URL"):
+                detail["_Source_URL"] = source_url_by_headline.get(headline, "")
+            ledger.append({
+                "type": "new_rating",
+                "priority": priority_by_key.get(_rating_event_key(event), "normal"),
+                "detail": detail,
+            })
+
+    ledger.sort(
+        key=lambda ch: (
+            _rating_date((ch.get("detail", {}) or {}).get("Time"))
+            or _rating_date((ch.get("detail", {}) or {}).get("_First_Seen"))
+        )
+        if isinstance(ch, dict) else "",
+        reverse=True,
+    )
+    return ledger
+
+
+def _rating_row_html(change: dict) -> str:
+    """渲染单行评级事件。
+
+    服务端首屏与前端切换视图共用这一份产物，避免两套模板走样。
+    """
+    d = change.get("detail", {}) or {}
+    symbol = str(d.get("Symbol") or "—")
+    is_tracked = symbol.strip().upper() in HOT_SYMBOLS
+    bank = str(d.get("Bank") or "—")
+    action = str(d.get("Action") or "—")
+    old_rating = str(d.get("Old_Rating") or "")
+    new_rating = str(d.get("New_Rating") or "")
+    price_target = str(d.get("Price_Target") or "—")
+    raw_time = str(d.get("Time") or "")
+    event_date = _rating_date(raw_time) or _rating_date(d.get("_First_Seen"))
+    display_time = f"{event_date}*" if d.get("_Time_Inferred") else (event_date or raw_time)
+    source = str(d.get("_Source") or "")
+    headline = str(d.get("_Headline") or "")
+    source_url = str(d.get("_Source_URL") or "")
+
+    # 证据列只标注可回溯的来源。占全部事件八成以上的“待补来源”留空，
+    # 避免整列变成对访客毫无信息量的免责声明。
+    evidence_html = ""
+    if source in {"verified_headline", "verified_summary", "yahoo_structured", "kr_headline"}:
+        evidence_html = '<span class="evidence evidence-verified">已验证</span>'
+    elif headline:
+        evidence_html = '<span class="evidence evidence-public">公开标题</span>'
+    if evidence_html and source_url.startswith("https://"):
+        evidence_html = (
+            f'<a class="evidence-link" href="{_safe_attr(source_url)}" target="_blank" '
+            f'rel="noopener noreferrer" title="{_safe_attr(headline or source_url)}">'
+            f'{evidence_html}<span class="evidence-arrow">↗</span></a>'
+        )
+
+    if old_rating or new_rating:
+        rating_cell = (
+            f'{_rating_badge(old_rating)}<span class="rating-arrow">→</span>{_rating_badge(new_rating)}'
+        )
+    else:
+        rating_cell = '<span class="tag tag-empty" title="来源未公布评级，并非抓取失败">—</span>'
+
+    symbol_href = _stock_href(symbol)
+    symbol_html = (
+        f'<a class="symbol" href="{_safe_attr(symbol_href)}">{_safe_text(symbol)}</a>'
+        if symbol_href
+        else f'<span class="symbol">{_safe_text(symbol)}</span>'
+    )
+    pt_html = (
+        _safe_text(price_target)
+        if price_target != "—"
+        else '<span class="pt-empty" title="来源未公布目标价，并非抓取失败">—</span>'
+    )
+
+    return (
+        f'<tr class="rating-row" data-symbol="{escape(symbol.upper(), quote=True)}"'
+        f' data-date="{escape(event_date, quote=True)}"'
+        f' data-bank="{escape(bank, quote=True)}"'
+        f' data-tracked="{"1" if is_tracked else "0"}">'
+        f'<td class="cell-dot">{_action_dot(action)}</td>'
+        f'<td><span class="symbol-cell">{_logo_html(symbol, size="row")}{symbol_html}</span></td>'
+        f'<td class="cell-bank">{_safe_text(bank)}</td>'
+        f'<td>{_safe_text(_action_display(action))}</td>'
+        f'<td class="cell-rating">{rating_cell}</td>'
+        f'<td class="mono cell-pt">{pt_html}</td>'
+        f'<td class="mono muted rating-time">{_safe_text(display_time)}</td>'
+        f'<td class="cell-evidence">{evidence_html}</td>'
+        '</tr>'
+    )
+
+
+def _select_rating_page(
+    ledger: list[dict],
+    *,
+    universe: str = "tracked",
+    days: int = 30,
+    sort: str = "time",
+    page: int = 1,
+    as_of: str = "",
+) -> dict:
+    """按 关注池/时间窗/排序 筛选账本并切出一页。"""
+    scoped = [
+        change
+        for change in ledger
+        if universe != "tracked"
+        or str((change.get("detail", {}) or {}).get("Symbol") or "").strip().upper() in HOT_SYMBOLS
+    ]
+
+    if days in RATING_WINDOWS and days != 30:
+        anchor = _rating_date(as_of)
+        if not anchor:
+            anchor = max(
+                (
+                    _rating_date((change.get("detail", {}) or {}).get("Time"))
+                    or _rating_date((change.get("detail", {}) or {}).get("_First_Seen"))
+                    for change in ledger
+                ),
+                default="",
+            )
+        if anchor:
+            cutoff = (
+                datetime.strptime(anchor, "%Y-%m-%d") - timedelta(days=days - 1)
+            ).strftime("%Y-%m-%d")
+            scoped = [
+                change
+                for change in scoped
+                if (
+                    _rating_date((change.get("detail", {}) or {}).get("Time"))
+                    or _rating_date((change.get("detail", {}) or {}).get("_First_Seen"))
+                ) >= cutoff
+            ]
+
+    if sort == "symbol":
+        scoped.sort(
+            key=lambda change: (
+                str((change.get("detail", {}) or {}).get("Symbol") or "").upper(),
+                _rating_date((change.get("detail", {}) or {}).get("Time")) or "",
+            )
+        )
+
+    total = len(scoped)
+    total_pages = max(1, math.ceil(total / RATING_PAGE_SIZE))
+    page = min(max(1, page), total_pages)
+    start = (page - 1) * RATING_PAGE_SIZE
+    return {
+        "rows": scoped[start:start + RATING_PAGE_SIZE],
+        "total": total,
+        "page": page,
+        "total_pages": total_pages,
+        "start": start,
+    }
+
+
 def _generate_html(report: dict, can_refresh: bool = False) -> str:
     """生成HTML报告页面 (适配专业量化分析结构)"""
     meta = report.get("meta", {})
@@ -651,7 +966,18 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     metadata = summary.get("Metadata", {}) if isinstance(summary, dict) else {}
     core_thesis = summary.get("Core_Thesis", "暂无数据") if isinstance(summary, dict) else "暂无数据"
     macro_vars = summary.get("Macro_Variables", {}) if isinstance(summary, dict) else {}
-    asset_targets = summary.get("Asset_Targets", []) if isinstance(summary, dict) else []
+    raw_asset_targets = summary.get("Asset_Targets", []) if isinstance(summary, dict) else []
+    asset_targets = [
+        item
+        for item in raw_asset_targets
+        if isinstance(item, dict)
+        and str(item.get("Asset") or "").strip().upper() in HOT_SYMBOLS
+        and (
+            item.get("_Source") in {"av_consensus", "verified_headline", "verified_summary", "yahoo_structured"}
+            or item.get("_Verified_PT")
+            or item.get("_Consensus")
+        )
+    ]
     stat_evidence = summary.get("Statistical_Evidence", "暂无数据") if isinstance(summary, dict) else "暂无数据"
     tail_risks = summary.get("Tail_Risks", []) if isinstance(summary, dict) else []
 
@@ -662,6 +988,41 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     raw = report.get("raw", {})
     news_count = len(raw.get("news", []))
     rec_count = len(raw.get("recommendations", []))
+    rating_events_for_intelligence = []
+    source_url_by_headline = {
+        str(item.get("title") or "").strip(): str(item.get("url") or "").strip()
+        for item in (raw.get("news", []) or [])
+        if isinstance(item, dict) and item.get("title") and item.get("url")
+    }
+    for item in (summary.get("Rating_Changes", []) or []) if isinstance(summary, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        enriched = dict(item)
+        headline = str(enriched.get("_Headline") or "").strip()
+        if headline and not enriched.get("_Source_URL"):
+            enriched["_Source_URL"] = source_url_by_headline.get(headline, "")
+        rating_events_for_intelligence.append(enriched)
+    market_context = report.get("market_context", {})
+    market_history = (
+        market_context.get("history", {})
+        if isinstance(market_context, dict)
+        else {}
+    )
+    institution_intelligence = report.get("institution_intelligence", {})
+    # 事件聚合是确定性的，渲染时用已补齐来源 URL 的事件重建一次，避免旧缓存
+    # 因算法升级或来源字段后补而长期展示过时画像。
+    if rating_events_for_intelligence:
+        institution_intelligence = build_institution_intelligence(
+            rating_events_for_intelligence,
+            market_history,
+            benchmark="SPY",
+            as_of=generated_at,
+            universe=HOT_SYMBOLS,
+        )
+    elif not isinstance(institution_intelligence, dict) or not institution_intelligence.get("version"):
+        institution_intelligence = build_institution_intelligence(
+            [], market_history, benchmark="SPY", as_of=generated_at, universe=HOT_SYMBOLS
+        )
     refresh_mode = str(meta.get("refresh_mode", "full"))
     # 令牌只注入机主版页面；公开访客的 HTML 不含此值
     refresh_token_js = json.dumps(
@@ -687,35 +1048,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     )
     CONTACT_EMAIL = "shangchaoxie888@gmail.com"
     X_PROFILE_URL = "https://x.com/johny_xie"
-
-    def _logo_url(symbol: str) -> str:
-        normalized = _normalize_logo_symbol(symbol)
-        if not normalized or symbol == "—":
-            return ""
-        return f'/assets/logos/{quote(normalized, safe="-")}.svg?v=2'
-
-    def _logo_html(symbol: str, size: str = "row") -> str:
-        url = _logo_url(symbol)
-        if not url:
-            return ""
-        normalized = _normalize_logo_symbol(symbol)
-        safe_url = _safe_attr(url)
-        safe_symbol = _safe_attr(symbol)
-        safe_initial = _safe_text(symbol[0] if symbol else "?")
-        pending_attr = (
-            ' data-logo-pending="1"'
-            if _read_cached_logo(normalized) is None
-            else ""
-        )
-        if size == "row":
-            return f'''<div class="logo-wrap row-logo-wrap">
-                <img class="row-logo" src="{safe_url}" alt="" loading="lazy"{pending_attr} onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
-                <div class="row-logo-fallback">{safe_initial}</div>
-            </div>'''
-        return f'''<div class="logo-wrap asset-logo-wrap">
-                <img class="asset-logo" src="{safe_url}" alt="{safe_symbol}" loading="lazy"{pending_attr} onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
-                <div class="asset-logo-fallback">{safe_initial}</div>
-            </div>'''
 
     def _find_historical_price_target(symbol: str, bank: str, current_time: str) -> Optional[str]:
         """从最近 7 天的报告中查找同一资产/投行的上一个目标价（结果按报告日期缓存）"""
@@ -753,61 +1085,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         _hist_pt_cache[cache_key] = result
         return result
 
-    def _is_bernstein(text: str) -> bool:
-        return "bernstein" in (text or "").lower()
-
-    def _bank_badge(bank: str) -> str:
-        if _is_bernstein(bank):
-            return '<span class="bernstein-badge" title="Bernstein（伯恩斯坦）高权重卖方">权威</span>'
-        return ''
-
-    def _rating_badge(rating: str) -> str:
-        if not rating:
-            return '<span class="tag tag-empty" title="来源未公布此项，并非抓取失败">—</span>'
-        r = rating.lower()
-        safe_rating = _safe_text(rating)
-        if any(k in r for k in ("buy", "overweight", "outperform", "strong buy")):
-            return f'<span class="tag tag-bull">{safe_rating}</span>'
-        if any(k in r for k in ("sell", "underweight", "underperform")):
-            return f'<span class="tag tag-bear">{safe_rating}</span>'
-        if any(k in r for k in ("hold", "neutral", "equal", "market")):
-            return f'<span class="tag tag-neutral">{safe_rating}</span>'
-        return f'<span class="tag">{safe_rating}</span>'
-
-    def _action_label(action: str) -> str:
-        if not action:
-            return ""
-        a = action.lower()
-        if "raise" in a or "upgrade" in a:
-            return '<span class="action-dot action-up"></span>'
-        if "cut" in a or "downgrade" in a or "lower" in a:
-            return '<span class="action-dot action-down"></span>'
-        if "initiate" in a or "new" in a:
-            return '<span class="action-dot action-new"></span>'
-        return '<span class="action-dot action-flat"></span>'
-
-    def _rating_date(value) -> str:
-        """将评级时间归一化为可排序、可筛选的 YYYY-MM-DD。"""
-        raw_value = str(value or "").strip()
-        match = re.search(r"\d{4}-\d{2}-\d{2}", raw_value)
-        if match:
-            return match.group(0)
-        for fmt in ("%Y/%m/%d", "%m/%d/%Y"):
-            try:
-                return datetime.strptime(raw_value[:10], fmt).strftime("%Y-%m-%d")
-            except ValueError:
-                continue
-        return ""
-
-    def _rating_event_key(detail: dict) -> tuple:
-        event_date = _rating_date(detail.get("Time")) or _rating_date(detail.get("_First_Seen"))
-        return (
-            str(detail.get("Bank", "")).strip().casefold(),
-            str(detail.get("Symbol", "")).strip().upper(),
-            str(detail.get("Action", "")).strip().casefold(),
-            event_date,
-        )
-
     def _asset_card(item: dict, price_target_map: dict) -> str:
         asset = item.get("Asset") or "—"
         target = item.get("Target_Price") or "—"
@@ -826,8 +1103,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             source_badge = '<span class="source-badge source-consensus">AV 共识</span>'
         elif source == "verified_headline":
             source_badge = '<span class="source-badge source-verified">已验证</span>'
-        elif source == "llm_inferred":
-            source_badge = '<span class="source-badge source-llm">研报推断</span>'
 
         # 评级分布条形（AV 共识）
         distribution_html = ""
@@ -864,7 +1139,9 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             time = change_info.get("Time", "") or ""
             current_pt = change_info.get("Price_Target") or target
             # Old_Rating 是评级不是旧目标价；旧目标价只在历史账本里有同机构记录时展示
-            old_pt = _find_historical_price_target(str(asset).upper(), bank, time)
+            old_pt = change_info.get("_Old_Price_Target") or _find_historical_price_target(
+                str(asset).upper(), bank, time
+            )
             if old_pt == current_pt:
                 old_pt = None
 
@@ -967,50 +1244,34 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 price_target_map[symbol] = c
 
     change_analysis = report.get("change_analysis", {}) or {}
-    analyzed_changes = list(change_analysis.get("changes", []) or [])
-    changes = []
     analysis_text = change_analysis.get("analysis", "") or ""
     # 变化分析失败时，旧报告会存占位串（如“分析服务暂时不可用”）；这类占位串
     # 不应原样展示——视作空，回退到 Core_Thesis，避免评分变更区出现误导文案。
     if analysis_text.strip() in {"分析服务暂时不可用", "无显著变化"}:
         analysis_text = ""
 
-    # 表格以 30 天事件账本为唯一事实源；变化分析只补充优先级和说明。
-    if isinstance(summary, dict):
-        summary_changes = summary.get("Rating_Changes", []) or []
-        priority_by_key = {
-            _rating_event_key(ch.get("detail", {}) or {}): ch.get("priority", "normal")
-            for ch in analyzed_changes
-            if isinstance(ch, dict)
-        }
-        for c in summary_changes:
-            if not isinstance(c, dict):
-                continue
-            key = _rating_event_key(c)
-            changes.append({
-                "type": "new_rating",
-                "priority": priority_by_key.get(
-                    key,
-                    "high" if "bernstein" in str(c.get("Bank", "")).lower() else "normal",
-                ),
-                "message": f"{c.get('Bank', '')} {c.get('Action', '')} {c.get('Symbol', '')} to {c.get('New_Rating', 'N/A')}",
-                "detail": c,
-            })
-        # 取 Core_Thesis 作为变化分析文本
-        if not analysis_text:
-            analysis_text = summary.get("Core_Thesis", "")
-    else:
-        changes = analyzed_changes
+    changes = _build_rating_ledger(report)
 
     # 机构徽章
     bank_bubbles = ""
-    coverage_banks = meta.get("coverage_banks", []) or []
+    coverage_banks = [
+        item.get("name")
+        for item in (institution_intelligence.get("institutions", []) or [])
+        if isinstance(item, dict) and item.get("name")
+    ]
+    if not coverage_banks:
+        coverage_banks = meta.get("coverage_banks", []) or []
+    # 机构与个股只露出前几个，其余折叠成计数并指向聚合页。
+    # 全部铺开会在首屏堆出 40 多颗同权重药丸，占版面又不传递信息。
     if coverage_banks:
         bank_bubbles = "".join(
-            f'<span class="bank-chip">{_safe_text(b)}</span>' for b in coverage_banks[:14]
+            f'<span class="bank-chip">{_safe_text(b)}</span>' for b in coverage_banks[:8]
         )
-        if len(coverage_banks) > 14:
-            bank_bubbles += f'<span class="bank-chip bank-more">+{len(coverage_banks) - 14}</span>'
+        if len(coverage_banks) > 8:
+            bank_bubbles += (
+                f'<a class="coverage-more" href="/institutions/">'
+                f'+{len(coverage_banks) - 8} 家 →</a>'
+            )
 
     # 资产覆盖标签
     assets_html = ""
@@ -1025,52 +1286,64 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 chip_bits.append(f'<span class="asset-chip">{label}</span>')
         assets_html = "".join(chip_bits)
 
-    # 评级变动表格
-    changes.sort(
-        key=lambda ch: (
-            _rating_date((ch.get("detail", {}) or {}).get("Time"))
-            or _rating_date((ch.get("detail", {}) or {}).get("_First_Seen"))
-        )
-        if isinstance(ch, dict) else "",
-        reverse=True,
+    # 评级变动表格（_build_rating_ledger 已按事件日倒序）
+    total_change_count = len(changes)
+    tracked_change_count = sum(
+        1
+        for change in changes
+        if str((change.get("detail", {}) or {}).get("Symbol") or "").strip().upper()
+        in HOT_SYMBOLS
     )
-    rating_rows = ""
-    if changes:
-        for ch in changes:
-            d = ch.get("detail", {}) or {}
-            symbol = str(d.get("Symbol") or "—")
-            bank = str(d.get("Bank") or "—")
-            action = str(d.get("Action") or "—")
-            old_r = str(d.get("Old_Rating") or "")
-            new_r = str(d.get("New_Rating") or "")
-            pt = str(d.get("Price_Target") or "—")
-            raw_time = str(d.get("Time") or "")
-            event_date = _rating_date(raw_time) or _rating_date(d.get("_First_Seen"))
-            time = f"{event_date}*" if d.get("_Time_Inferred") else (event_date or raw_time)
-            priority = ch.get("priority", "")
-            priority_cls = "priority-high" if priority == "high" else "priority-normal"
-            rating_rows += f"""
-            <tr class="rating-row" data-symbol="{escape(symbol.upper(), quote=True)}" data-date="{escape(event_date, quote=True)}" data-bank="{escape(bank, quote=True)}">
-                <td>{_action_label(action)}</td>
-                <td>
-                    <div class="symbol-cell">
-                        {_logo_html(symbol, size='row')}
-                        {f'<a class="symbol" href="{_safe_attr(_stock_href(symbol))}">{_safe_text(symbol)}</a>' if _stock_href(symbol) else f'<span class="symbol">{_safe_text(symbol)}</span>'}
-                    </div>
-                </td>
-                <td>{_safe_text(bank)}{_bank_badge(bank)}</td>
-                <td class="mono">{_safe_text(action.replace("_", " ").title())}</td>
-                <td>{_rating_badge(old_r)}</td>
-                <td class="arrow">→</td>
-                <td>{_rating_badge(new_r)}</td>
-                <td class="mono">{_safe_text(pt) if pt != "—" else '<span class="pt-empty" title="来源未公布目标价，并非抓取失败">—</span>'}</td>
-                <td class="mono muted rating-time">{_safe_text(time)}</td>
-                <td><span class="{priority_cls}">{_safe_text(str(priority).upper())}</span></td>
-            </tr>
-            """
-        rating_rows += '<tr id="ratingFilterEmpty" hidden><td colspan="10" class="empty-cell">该时间段暂无评级变动</td></tr>'
+    report_as_of = _rating_date(generated_at)
+    latest_rating_date = max(
+        (
+            _rating_date((change.get("detail", {}) or {}).get("Time"))
+            or _rating_date((change.get("detail", {}) or {}).get("_First_Seen"))
+            for change in changes
+            if isinstance(change, dict)
+        ),
+        default="",
+    )
+
+    # 只有首屏那一页进入 DOM，其余行以预渲染字符串放进 JSON 岛。
+    # 之前把 30 天全部账本写进表格会产生两万多个 DOM 节点；渲染同一个
+    # _rating_row_html 保证服务端首屏与前端切换视图不会走样。
+    all_row_html = [_rating_row_html(change) for change in changes]
+    default_page = _select_rating_page(
+        changes, universe="tracked", days=30, sort="time", page=1, as_of=report_as_of
+    )
+    if default_page["rows"]:
+        rating_rows = "".join(_rating_row_html(change) for change in default_page["rows"])
+        rating_rows += '<tr id="ratingFilterEmpty" hidden><td colspan="8" class="empty-cell">该时间段暂无评级变动</td></tr>'
     else:
-        rating_rows = '<tr id="ratingFilterEmpty"><td colspan="10" class="empty-cell">最近 30 天暂无显著评级变动</td></tr>'
+        rating_rows = '<tr id="ratingFilterEmpty"><td colspan="8" class="empty-cell">最近 30 天暂无显著评级变动</td></tr>'
+
+    default_total = default_page["total"]
+    default_pages = default_page["total_pages"]
+    default_range = (
+        f"{default_page['start'] + 1}–{min(default_page['start'] + RATING_PAGE_SIZE, default_total)}"
+        f" / 共 {default_total} 条"
+        if default_total
+        else "共 0 条"
+    )
+    default_pagination_hidden = " hidden" if default_pages <= 1 else ""
+
+    rating_ledger_json = json.dumps(
+        [
+            {
+                "s": str((change.get("detail", {}) or {}).get("Symbol") or "").upper(),
+                "d": (
+                    _rating_date((change.get("detail", {}) or {}).get("Time"))
+                    or _rating_date((change.get("detail", {}) or {}).get("_First_Seen"))
+                ),
+                "t": 1 if str((change.get("detail", {}) or {}).get("Symbol") or "").strip().upper() in HOT_SYMBOLS else 0,
+                "h": html_row,
+            }
+            for change, html_row in zip(changes, all_row_html)
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).replace("<", "\\u003c").replace("&", "\\u0026")
 
     # 资产目标网格（防御性去重：同一只股票只保留第一张卡）
     asset_cards = ""
@@ -1103,8 +1376,16 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         macro_html = '<p class="empty">暂无宏观数据</p>'
 
     # 页脚数据源
-    data_sources = meta.get("data_sources", ["finnhub", "alpha_vantage", "seeking_alpha", "reddit", "google_news"])
-    sources_html = ", ".join(_safe_text(str(s).title()) for s in data_sources)
+    data_sources = []
+    if rec_count:
+        data_sources.append(f"Finnhub 分析师共识 ({rec_count})")
+    if news_count:
+        data_sources.append(f"公开新闻 / RSS ({news_count})")
+    if market_history:
+        data_sources.append(f"Yahoo Finance 复权行情 ({len(market_history)})")
+    if isinstance(summary, dict) and summary.get("_av_overviews"):
+        data_sources.append(f"Alpha Vantage 一致预期 ({len(summary['_av_overviews'])})")
+    sources_html = " · ".join(_safe_text(str(source)) for source in data_sources) or "本轮暂无可用来源"
 
     analysis_state = str(meta.get("analysis_status", "")).lower()
     is_degraded = bool(
@@ -1157,7 +1438,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     safe_generated_at = _safe_text(generated_at[:19])
     safe_generated_at_attr = _safe_attr(generated_at)
     safe_refresh_mode = _safe_text(refresh_mode)
-    safe_core_thesis = _safe_multiline(core_thesis)
+    safe_core_thesis = _paragraphed(core_thesis)
     safe_stat_evidence = _safe_multiline(stat_evidence)
     analysis_panel_html = (
         "<p class='analysis-text panel' style='margin-bottom:18px;'>"
@@ -1166,10 +1447,127 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         if analysis_text else ""
     )
 
+    intelligence_institutions = [
+        item
+        for item in (institution_intelligence.get("institutions", []) or [])
+        if isinstance(item, dict)
+    ]
+    intelligence_events = [
+        item
+        for item in (institution_intelligence.get("events", []) or [])
+        if isinstance(item, dict)
+    ]
+    sentiment = institution_intelligence.get("market_sentiment", {}) or {}
+    reaction_coverage = institution_intelligence.get("market_reaction_coverage", {}) or {}
+
+    def _format_percent(value, *, signed: bool = True) -> str:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return "—"
+        return f"{number:+.1%}" if signed else f"{number:.0%}"
+
+    institution_cards_html = ""
+    for item in intelligence_institutions[:6]:
+        tone = str(item.get("tone") or "中性")
+        tone_class = "tone-bull" if tone == "偏多" else "tone-bear" if tone == "偏空" else "tone-mixed"
+        alignment_rate = item.get("alignment_rate")
+        alignment_text = _format_percent(alignment_rate, signed=False) if alignment_rate is not None else "待验证"
+        symbols = "".join(
+            f'<a href="/stocks/{_safe_attr(str(symbol).lower())}/">{_safe_text(symbol)}</a>'
+            for symbol in (item.get("symbols") or [])[:5]
+            if str(symbol).upper() in HOT_SYMBOLS
+        )
+        institution_cards_html += f"""
+        <article class="institution-card">
+            <div class="institution-card-head">
+                <a href="/institutions/{_safe_attr(item.get('slug'))}/">{_safe_text(item.get('name'))}</a>
+                <span class="tone-badge {tone_class}">公开倾向 · {_safe_text(tone)}</span>
+            </div>
+            <div class="institution-stats">
+                <span><b>{int(item.get('event_count') or 0)}</b> 条动作</span>
+                <span class="bull-text">{int(item.get('bullish') or 0)} 偏多</span>
+                <span class="bear-text">{int(item.get('bearish') or 0)} 偏空</span>
+                <span>方向一致率 {alignment_text}</span>
+            </div>
+            <p>{_safe_text(item.get('interpretation') or '')}</p>
+            <div class="institution-card-foot">
+                <span class="institution-symbols">{symbols or '—'}</span>
+                <span>验证样本 {int(item.get('market_evaluated') or 0)} · 置信度 {_safe_text(item.get('confidence') or '低')}</span>
+            </div>
+        </article>
+        """
+    if not institution_cards_html:
+        institution_cards_html = '<p class="empty">关注池内暂无可归集的机构观点。</p>'
+
+    reaction_rows_html = ""
+    for event in intelligence_events[:10]:
+        reaction = event.get("reaction", {}) or {}
+        excess = reaction.get("excess_returns", {}) or {}
+        horizon = ""
+        value = None
+        for candidate in ("5d", "20d", "1d"):
+            if excess.get(candidate) is not None:
+                horizon, value = candidate, excess[candidate]
+                break
+        stance = str(event.get("stance") or "neutral")
+        stance_class = "tone-bull" if stance == "bullish" else "tone-bear" if stance == "bearish" else "tone-mixed"
+        alignment = str(reaction.get("alignment") or "pending")
+        alignment_class = {
+            "aligned": "reaction-aligned",
+            "diverged": "reaction-diverged",
+            "mixed": "reaction-mixed",
+        }.get(alignment, "reaction-pending")
+        source_url = str(event.get("source_url") or "")
+        action_text = _safe_text(event.get("action_label") or event.get("action") or "—")
+        if source_url.startswith("https://"):
+            action_text = (
+                f'<a href="{_safe_attr(source_url)}" target="_blank" rel="noopener noreferrer">'
+                f'{action_text}<span aria-hidden="true"> ↗</span></a>'
+            )
+        reaction_rows_html += f"""
+        <tr>
+            <td><a href="/institutions/{_safe_attr(event.get('institution_slug'))}/">{_safe_text(event.get('institution'))}</a></td>
+            <td><a class="symbol" href="/stocks/{_safe_attr(str(event.get('symbol') or '').lower())}/">{_safe_text(event.get('symbol'))}</a></td>
+            <td><span class="tone-badge {stance_class}">{_safe_text(event.get('stance_label'))}</span> {action_text}</td>
+            <td class="mono">{_safe_text(event.get('price_target') or '—')}</td>
+            <td class="mono">{_safe_text(horizon.upper() if horizon else '—')} {_safe_text(_format_percent(value) if value is not None else '—')}</td>
+            <td><span class="reaction-state {alignment_class}">{_safe_text(reaction.get('alignment_label') or '等待验证')}</span></td>
+            <td class="mono muted">{_safe_text(event.get('date') or '')}</td>
+        </tr>
+        """
+    if not reaction_rows_html:
+        reaction_rows_html = '<tr><td colspan="7" class="empty-cell">暂无可验证事件</td></tr>'
+
+    institution_count = len(intelligence_institutions)
+    tracked_event_count = int(sentiment.get("event_count") or len(intelligence_events))
+    evaluated_event_count = int(reaction_coverage.get("evaluated") or 0)
+    verified_target_count = sum(
+        1
+        for item in asset_targets
+        if isinstance(item, dict) and item.get("Target_Price")
+    )
+
     stock_strip = "".join(
         f'<a class="asset-chip" href="/stocks/{ticker.lower()}/">{_safe_text(ticker)}</a>'
-        for ticker in HOT_SYMBOLS
+        for ticker in HOT_SYMBOLS[:12]
     )
+    if len(HOT_SYMBOLS) > 12:
+        stock_strip += (
+            f'<a class="coverage-more" href="/stocks/">'
+            f'+{len(HOT_SYMBOLS) - 12} 只 →</a>'
+        )
+    coverage_rows = ""
+    if bank_bubbles:
+        coverage_rows += (
+            '<div class="coverage-label">覆盖机构</div>'
+            f'<div class="coverage-items">{bank_bubbles}</div>'
+        )
+    coverage_rows += (
+        '<div class="coverage-label">关注池</div>'
+        f'<div class="coverage-items">{stock_strip}</div>'
+    )
+    coverage_html = f'<div class="coverage">{coverage_rows}</div>'
     seo_head_html = homepage_head_html(date_range, generated_at)
 
     html = f"""<!DOCTYPE html>
@@ -1178,195 +1576,15 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
 {seo_head_html}
     <link rel="shortcut icon" href="/favicon.ico?v=2" />
     <style>
-            :root {{
-                --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
-                --font-serif: "Iowan Old Style", "Songti SC", "STSong", Georgia, serif;
-                --font-mono: "SFMono-Regular", "Cascadia Mono", Consolas, "Liberation Mono", monospace;
-                --bg: #08080a;
-                --bg-elevated: #0c0c10;
-                --surface: #12121a;
-                --surface-2: #1a1a24;
-                --surface-3: #22222e;
-                --border: rgba(232, 230, 227, 0.07);
-                --border-strong: rgba(232, 230, 227, 0.15);
-                --text: #f2f0ec;
-                --text-secondary: #9a9791;
-                --text-tertiary: #6b6862;
-                --gold: #c9a45c;
-                --gold-bright: #d4af37;
-                --gold-dim: rgba(201, 164, 92, 0.10);
-                --gold-glow: rgba(201, 164, 92, 0.22);
-                --bull: #4ade80;
-                --bear: #f87171;
-                --neutral: #fbbf24;
-                --accent: #7dd3fc;
-                --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.25);
-                --shadow-md: 0 8px 30px rgba(0, 0, 0, 0.35);
-                --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.45);
-                --radius-sm: 8px;
-                --radius-md: 14px;
-                --radius-lg: 20px;
-                --radius-xl: 28px;
-                --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
-                --ease-spring: cubic-bezier(0.34, 1.56, 0.64, 1);
-            }}
-            :root[data-theme="light"] {{
-                --bg: #f7f5f0;
-                --bg-elevated: #ffffff;
-                --surface: #ffffff;
-                --surface-2: #f2efe9;
-                --surface-3: #e8e4dc;
-                --border: rgba(30, 25, 18, 0.10);
-                --border-strong: rgba(30, 25, 18, 0.18);
-                --text: #1e1912;
-                --text-secondary: #5c564c;
-                --text-tertiary: #8a8378;
-                --gold: #8b6914;
-                --gold-bright: #a67c00;
-                --gold-dim: rgba(139, 105, 20, 0.08);
-                --gold-glow: rgba(139, 105, 20, 0.15);
-                --bull: #15803d;
-                --bear: #b91c1c;
-                --neutral: #a16207;
-                --accent: #0369a1;
-                --shadow-sm: 0 4px 12px rgba(30, 25, 18, 0.08);
-                --shadow-md: 0 8px 30px rgba(30, 25, 18, 0.10);
-                --shadow-lg: 0 20px 60px rgba(30, 25, 18, 0.12);
-            }}
-            :root[data-theme="sepia"] {{
-                --bg: #f0e9db;
-                --bg-elevated: #faf5eb;
-                --surface: #faf5eb;
-                --surface-2: #e9e0cd;
-                --surface-3: #ded3bd;
-                --border: rgba(60, 48, 30, 0.12);
-                --border-strong: rgba(60, 48, 30, 0.22);
-                --text: #2e2418;
-                --text-secondary: #5c4d3a;
-                --text-tertiary: #8a7660;
-                --gold: #6b4c1e;
-                --gold-bright: #7d5a24;
-                --gold-dim: rgba(107, 76, 30, 0.10);
-                --gold-glow: rgba(107, 76, 30, 0.15);
-                --bull: #3f6212;
-                --bear: #991b1b;
-                --neutral: #854d0e;
-                --accent: #1e40af;
-                --shadow-sm: 0 4px 12px rgba(60, 48, 30, 0.08);
-                --shadow-md: 0 8px 30px rgba(60, 48, 30, 0.10);
-                --shadow-lg: 0 20px 60px rgba(60, 48, 30, 0.12);
-            }}
-            :root[data-theme="dark"] {{
-                --bg: #08080a;
-                --bg-elevated: #0c0c10;
-                --surface: #12121a;
-                --surface-2: #1a1a24;
-                --surface-3: #22222e;
-                --border: rgba(232, 230, 227, 0.07);
-                --border-strong: rgba(232, 230, 227, 0.15);
-                --text: #f2f0ec;
-                --text-secondary: #9a9791;
-                --text-tertiary: #6b6862;
-                --gold: #c9a45c;
-                --gold-bright: #d4af37;
-                --gold-dim: rgba(201, 164, 92, 0.10);
-                --gold-glow: rgba(201, 164, 92, 0.22);
-                --bull: #4ade80;
-                --bear: #f87171;
-                --neutral: #fbbf24;
-                --accent: #7dd3fc;
-                --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.25);
-                --shadow-md: 0 8px 30px rgba(0, 0, 0, 0.35);
-                --shadow-lg: 0 20px 60px rgba(0, 0, 0, 0.45);
-            }}
-            
-            * {{ box-sizing: border-box; }}
-            
-            html {{ scroll-behavior: smooth; }}
-            
-            body {{
-                margin: 0;
-                background: var(--bg);
-                color: var(--text);
-                font-family: var(--font-sans);
-                line-height: 1.6;
-                -webkit-font-smoothing: antialiased;
-                -moz-osx-font-smoothing: grayscale;
-                min-height: 100vh;
-            }}
-            
-            /* Atmospheric background layers */
-            body::before {{
-                content: "";
-                position: fixed;
-                inset: 0;
-                pointer-events: none;
-                z-index: 0;
-                background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 400 400' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noiseFilter'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noiseFilter)'/%3E%3C/svg%3E");
-                opacity: 0.035;
-                mix-blend-mode: overlay;
-            }}
-            body::after {{
-                content: "";
-                position: fixed;
-                top: -20%;
-                left: -10%;
-                width: 60vw;
-                height: 60vw;
-                pointer-events: none;
-                z-index: 0;
-                background: radial-gradient(circle, var(--gold-glow) 0%, transparent 55%);
-                filter: blur(100px);
-                opacity: 0.6;
-            }}
-            
-            .wrap {{
-                position: relative;
-                z-index: 1;
-                max-width: 1240px;
-                margin: 0 auto;
-                padding: 56px 28px 100px;
-            }}
-            
-            /* Typography */
-            .serif {{ font-family: var(--font-serif); }}
-            .mono {{ font-family: var(--font-mono); }}
+{PAGE_CSS}
             .display {{ font-family: var(--font-serif); }}
-            
-            /* Reveal animations */
-            @keyframes fadeUp {{
-                from {{ opacity: 0; transform: translateY(30px); }}
-                to {{ opacity: 1; transform: translateY(0); }}
-            }}
-            @keyframes fadeIn {{
-                from {{ opacity: 0; }}
-                to {{ opacity: 1; }}
-            }}
-            @keyframes scaleIn {{
-                from {{ opacity: 0; transform: scale(0.96); }}
-                to {{ opacity: 1; transform: scale(1); }}
-            }}
-            @keyframes lineExpand {{
-                from {{ transform: scaleX(0); }}
-                to {{ transform: scaleX(1); }}
-            }}
             @keyframes pulse {{
                 0% {{ box-shadow: 0 0 0 0 rgba(74, 222, 128, 0.4); }}
                 70% {{ box-shadow: 0 0 0 8px rgba(74, 222, 128, 0); }}
                 100% {{ box-shadow: 0 0 0 0 rgba(74, 222, 128, 0); }}
             }}
             @keyframes spin {{ 100% {{ transform: rotate(360deg); }} }}
-            
-            .reveal {{
-                opacity: 0;
-                animation: fadeUp 0.8s var(--ease-out) forwards;
-            }}
-            .reveal-delay-1 {{ animation-delay: 0.06s; }}
-            .reveal-delay-2 {{ animation-delay: 0.14s; }}
-            .reveal-delay-3 {{ animation-delay: 0.22s; }}
-            .reveal-delay-4 {{ animation-delay: 0.30s; }}
-            .reveal-delay-5 {{ animation-delay: 0.38s; }}
-            
+
             /* Header */
             .topbar {{
                 display: flex;
@@ -1467,39 +1685,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 text-align: right;
             }}
             
-            /* Theme switcher */
-            .theme-switcher {{
-                display: flex;
-                align-items: center;
-                gap: 4px;
-                background: var(--surface);
-                border: 1px solid var(--border);
-                border-radius: 999px;
-                padding: 4px;
-            }}
-            .theme-btn {{
-                background: transparent;
-                color: var(--text-secondary);
-                border: none;
-                width: 34px;
-                height: 34px;
-                display: inline-flex;
-                align-items: center;
-                justify-content: center;
-                border-radius: 999px;
-                cursor: pointer;
-                transition: all 0.2s var(--ease-out);
-                font-family: "Bricolage Grotesk", sans-serif;
-            }}
-            .theme-btn svg {{ width: 17px; height: 17px; display: block; }}
-            .theme-btn.active {{
-                background: var(--gold);
-                color: var(--bg);
-                box-shadow: 0 2px 8px var(--gold-glow);
-            }}
-            .theme-btn:hover {{ color: var(--text); }}
-            .theme-btn.active:hover {{ color: var(--bg); }}
-            
             /* Degraded banner */
             .degraded-banner {{
                 display: flex;
@@ -1531,157 +1716,126 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             }}
             
             /* Hero */
-            .hero {{
-                display: grid;
-                grid-template-columns: 1.3fr 0.7fr;
-                gap: 56px;
-                align-items: end;
-                margin-bottom: 80px;
-                position: relative;
-            }}
-            .hero::before {{
-                content: "";
-                position: absolute;
-                top: -40px;
-                left: -40px;
-                width: 120px;
-                height: 120px;
-                border: 1px solid var(--border);
-                border-radius: 50%;
-                opacity: 0.5;
-                pointer-events: none;
-            }}
+            .hero {{ margin-bottom: 44px; }}
             .hero-title {{
-                font-size: clamp(44px, 7vw, 86px);
-                line-height: 1.0;
+                font-size: clamp(38px, 5.6vw, 68px);
+                line-height: 1.06;
                 font-weight: 500;
-                letter-spacing: -0.04em;
-                margin: 0 0 24px;
+                letter-spacing: -0.03em;
+                margin: 0 0 22px;
+                max-width: 20ch;
                 color: var(--text);
             }}
             .hero-title em {{
                 font-style: italic;
                 color: var(--gold);
                 font-weight: 400;
+                white-space: nowrap;
             }}
             .hero-sub {{
-                font-size: 16px;
+                font-size: 16.5px;
                 color: var(--text-secondary);
-                max-width: 540px;
+                max-width: 62ch;
                 line-height: 1.75;
-                margin: 0 0 28px;
+                margin: 0 0 20px;
             }}
-            .meta-grid {{
+            .hero-boundary {{
+                max-width: 62ch;
+                margin: 0 0 8px;
+                padding-left: 14px;
+                border-left: 2px solid var(--gold);
+                color: var(--text-tertiary);
+                font-size: 12.5px;
+                line-height: 1.7;
+            }}
+
+            /* 覆盖范围：机构与个股折叠成一条安静的元数据带，
+               之前 44 颗同权重药丸占掉首屏一大块又不传递信息。 */
+            .coverage {{
                 display: grid;
-                gap: 16px;
+                grid-template-columns: 88px 1fr;
+                gap: 10px 16px;
+                align-items: start;
+                margin-top: 26px;
+                padding-top: 20px;
+                border-top: 1px solid var(--border);
+            }}
+            .coverage-label {{
+                font-family: var(--font-mono);
+                font-size: 10.5px;
+                letter-spacing: 0.12em;
+                text-transform: uppercase;
+                color: var(--text-tertiary);
+                padding-top: 5px;
+            }}
+            .coverage-items {{ display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }}
+            .bank-chip {{
+                font-size: 11.5px;
+                color: var(--text-secondary);
+                border: 1px solid var(--border);
+                padding: 4px 11px;
+                border-radius: 999px;
                 background: var(--surface);
+            }}
+            .asset-chip {{
+                font-family: var(--font-mono);
+                font-size: 11.5px;
+                letter-spacing: 0.03em;
+                background: var(--surface-2);
+                color: var(--text-secondary);
+                padding: 4px 9px;
+                border-radius: var(--radius-sm);
+                border: 1px solid var(--border);
+                transition: color 0.2s var(--ease-out), border-color 0.2s var(--ease-out);
+            }}
+            .asset-chip:hover {{ color: var(--gold); border-color: var(--gold); text-decoration: none; }}
+            .coverage-more {{
+                font-size: 11.5px;
+                color: var(--gold);
+                white-space: nowrap;
+            }}
+
+            /* Hero 指标带 */
+            .hero-metrics {{
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(158px, 1fr));
+                gap: 1px;
+                background: var(--border);
                 border: 1px solid var(--border);
                 border-radius: var(--radius-lg);
-                padding: 28px;
-                box-shadow: var(--shadow-md);
-                position: relative;
                 overflow: hidden;
+                margin-bottom: 72px;
             }}
-            .meta-grid::before {{
-                content: "";
-                position: absolute;
-                top: 0;
-                left: 0;
-                right: 0;
-                height: 2px;
-                background: linear-gradient(90deg, var(--gold), transparent);
-                opacity: 0.6;
-            }}
-            .meta-item {{
-                border-left: 2px solid var(--border-strong);
-                padding-left: 16px;
-            }}
+            .meta-item {{ background: var(--surface); padding: 18px 20px; }}
             .meta-label {{
-                font-size: 10px;
+                font-size: 10.5px;
+                letter-spacing: 0.1em;
                 text-transform: uppercase;
-                letter-spacing: 0.18em;
                 color: var(--text-tertiary);
-                margin-bottom: 5px;
+                margin-bottom: 7px;
                 font-weight: 600;
             }}
             .meta-value {{
-                font-size: 15px;
+                font-size: 22px;
+                line-height: 1.2;
                 color: var(--text);
                 font-weight: 500;
+                font-variant-numeric: tabular-nums;
             }}
-            .meta-value.muted {{ color: var(--text-secondary); }}
+            .meta-value.is-small {{ font-size: 13px; letter-spacing: 0.01em; }}
+            .meta-value .muted {{ font-size: 11.5px; color: var(--text-tertiary); }}
             
-            /* Bank / asset chips */
-            .bank-strip {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 8px;
-                margin-top: 18px;
-            }}
-            .bank-chip {{
-                font-size: 11px;
-                color: var(--text-secondary);
-                border: 1px solid var(--border);
-                padding: 5px 12px;
-                border-radius: 999px;
-                background: var(--surface);
-                transition: all 0.2s ease;
-            }}
-            .bank-chip:hover {{
-                border-color: var(--gold);
-                color: var(--gold);
-                background: var(--gold-dim);
-            }}
-            .bank-more {{
-                color: var(--gold);
-                border-color: var(--gold-dim);
-                background: var(--gold-dim);
-                font-weight: 600;
-            }}
-            .asset-chip {{
-                font-family: "JetBrains Mono", monospace;
-                font-size: 12px;
-                background: var(--surface-2);
-                color: var(--text);
-                padding: 5px 10px;
-                border-radius: var(--radius-sm);
-                border: 1px solid var(--border);
-            }}
-            
-            /* Section */
-            .section {{ margin-bottom: 64px; }}
-            .section-head {{
-                display: flex;
-                align-items: baseline;
-                justify-content: space-between;
-                margin-bottom: 24px;
-                padding-bottom: 14px;
-                border-bottom: 1px solid var(--border);
-                position: relative;
-            }}
+            /* Section：结构样式来自 design_system，这里只加首页的金色下划线点缀 */
+            .section-head {{ position: relative; }}
             .section-head::after {{
                 content: "";
                 position: absolute;
                 bottom: -1px;
                 left: 0;
-                width: 80px;
+                width: 72px;
                 height: 1px;
                 background: var(--gold);
-                opacity: 0.6;
-            }}
-            .section-title {{
-                font-size: 12px;
-                text-transform: uppercase;
-                letter-spacing: 0.22em;
-                color: var(--gold);
-                font-weight: 700;
-                font-family: "JetBrains Mono", monospace;
-            }}
-            .section-count {{
-                font-family: "Fraunces", serif;
-                font-size: 15px;
-                color: var(--text-tertiary);
-                font-style: italic;
+                opacity: 0.7;
             }}
             
             /* Panels / cards */
@@ -1713,20 +1867,24 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             }}
             .panel:hover::before {{ opacity: 0.5; }}
             
-            /* Core thesis */
+            /* Core thesis：正文与右侧风险栏字号原本 32px vs 11px，
+               层级完全倒置；这里压到可比的区间并按句拆段。 */
             .thesis {{
-                font-size: clamp(22px, 3vw, 32px);
-                line-height: 1.55;
+                font-size: 16.5px;
+                line-height: 1.85;
                 color: var(--text);
-                font-weight: 300;
+                font-weight: 400;
+                max-width: 68ch;
             }}
+            .thesis p {{ margin: 0 0 14px; }}
+            .thesis p:last-child {{ margin-bottom: 0; }}
             .thesis::before {{
                 content: "";
                 display: block;
-                width: 48px;
-                height: 3px;
+                width: 40px;
+                height: 2px;
                 background: var(--gold);
-                margin-bottom: 26px;
+                margin-bottom: 20px;
                 border-radius: 2px;
             }}
             
@@ -1801,11 +1959,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 background: var(--gold-dim);
                 border: 1px solid rgba(201, 164, 92, 0.25);
             }}
-            .source-llm {{
-                color: var(--text-tertiary);
-                background: var(--surface-2);
-                border: 1px solid var(--border);
-            }}
             .analyst-dist {{
                 margin: 12px 0 4px;
             }}
@@ -1857,22 +2010,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 justify-content: center;
             }}
             
-            /* Bernstein badge */
-            .bernstein-badge {{
-                display: inline-flex;
-                align-items: center;
-                font-family: "JetBrains Mono", monospace;
-                font-size: 9px;
-                font-weight: 700;
-                color: var(--bg);
-                background: var(--gold);
-                padding: 3px 7px;
-                border-radius: 4px;
-                margin-left: 8px;
-                vertical-align: middle;
-                letter-spacing: 0.05em;
-            }}
-            
             /* Rating toolbar */
             .rating-toolbar {{
                 display: flex;
@@ -1886,6 +2023,12 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 display: flex;
                 align-items: center;
                 gap: 10px;
+                flex-wrap: wrap;
+            }}
+            .rating-toolbar-cluster {{
+                display: flex;
+                align-items: center;
+                gap: 16px;
                 flex-wrap: wrap;
             }}
             .rating-toolbar-label {{
@@ -1926,152 +2069,196 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 font-size: 11px;
                 color: var(--text-secondary);
             }}
-            
-            /* Table */
-            .table-wrap {{
-                overflow-x: auto;
-                border-radius: var(--radius-lg);
+            .rating-pagination {{
+                display: flex;
+                justify-content: flex-end;
+                align-items: center;
+                gap: 10px;
+                margin-top: 14px;
+            }}
+            .rating-pagination-top {{
+                margin: 0;
+            }}
+            .rating-pagination-top .rating-page-btn {{
+                min-width: 30px;
+                padding: 6px 9px;
+            }}
+            .rating-pagination-top .rating-page-status {{
+                min-width: 58px;
+            }}
+            .rating-pagination[hidden] {{ display: none; }}
+            .rating-page-btn {{
                 border: 1px solid var(--border);
-                background: var(--surface);
-                box-shadow: var(--shadow-sm);
-            }}
-            table {{
-                width: 100%;
-                border-collapse: separate;
-                border-spacing: 0;
-                font-size: 14px;
-            }}
-            thead th {{
-                background: var(--surface-2);
-                color: var(--text-secondary);
-                font-weight: 600;
-                text-transform: uppercase;
-                font-size: 10px;
-                letter-spacing: 0.12em;
-                padding: 16px;
-                text-align: left;
-                white-space: nowrap;
-                border-bottom: 1px solid var(--border);
-                font-family: "JetBrains Mono", monospace;
-                position: sticky;
-                top: 0;
-                z-index: 2;
-            }}
-            thead th:first-child {{ border-top-left-radius: var(--radius-lg); }}
-            thead th:last-child {{ border-top-right-radius: var(--radius-lg); }}
-            tbody tr {{
-                border-bottom: 1px solid var(--border);
-                transition: background 0.2s ease;
-            }}
-            tbody tr:last-child {{ border-bottom: none; }}
-            tbody tr:hover {{ background: rgba(201, 164, 92, 0.04); }}
-            tbody tr.group-start td {{ border-top: 2px solid rgba(201, 164, 92, 0.22); }}
-            tbody tr[hidden] {{ display: none; }}
-            tbody td {{
-                padding: 18px 16px;
-                vertical-align: middle;
-                border-bottom: 1px solid var(--border);
-            }}
-            tbody tr:last-child td {{ border-bottom: none; }}
-            .symbol {{
-                font-family: "JetBrains Mono", monospace;
-                font-weight: 700;
-                color: var(--text);
-                font-size: 15px;
-                letter-spacing: -0.02em;
-            }}
-            .rating-time {{
-                white-space: nowrap;
-                color: var(--text-secondary);
-            }}
-            .arrow {{
-                color: var(--text-tertiary);
-                font-size: 13px;
-                padding-left: 4px;
-                padding-right: 4px;
-            }}
-            .tag {{
-                display: inline-block;
-                font-size: 11px;
-                font-weight: 700;
-                letter-spacing: 0.03em;
-                padding: 5px 11px;
                 border-radius: 999px;
-                border: 1px solid var(--border);
+                padding: 7px 13px;
                 color: var(--text-secondary);
-                background: rgba(255, 255, 255, 0.03);
+                background: var(--surface);
+                cursor: pointer;
+                font: 500 12px "Bricolage Grotesk", sans-serif;
+                transition: border-color .2s ease, color .2s ease, background .2s ease;
             }}
-            .tag-bull {{
-                color: var(--bull);
-                border-color: rgba(74, 222, 128, 0.25);
-                background: rgba(74, 222, 128, 0.08);
+            .rating-page-btn:hover:not(:disabled) {{
+                border-color: var(--gold);
+                color: var(--text);
+                background: var(--gold-dim);
             }}
-            .tag-empty {{
-                color: var(--text-tertiary);
-                border-style: dashed;
-                background: transparent;
-                cursor: help;
+            .rating-page-btn:disabled {{
+                opacity: .38;
+                cursor: not-allowed;
             }}
-            .pt-empty {{
-                color: var(--text-tertiary);
-                cursor: help;
-            }}
-            .tag-bear {{
-                color: var(--bear);
-                border-color: rgba(248, 113, 113, 0.25);
-                background: rgba(248, 113, 113, 0.08);
-            }}
-            .tag-neutral {{
-                color: var(--neutral);
-                border-color: rgba(251, 191, 36, 0.25);
-                background: rgba(251, 191, 36, 0.08);
-            }}
-            .action-dot {{
-                display: inline-block;
-                width: 8px;
-                height: 8px;
-                border-radius: 50%;
-            }}
-            .action-up {{
-                background: var(--bull);
-                box-shadow: 0 0 10px rgba(74, 222, 128, 0.5);
-            }}
-            .action-down {{
-                background: var(--bear);
-                box-shadow: 0 0 10px rgba(248, 113, 113, 0.5);
-            }}
-            .action-new {{
-                background: var(--accent);
-                box-shadow: 0 0 10px rgba(125, 211, 252, 0.5);
-            }}
-            .action-flat {{
-                background: var(--text-tertiary);
-            }}
-            .priority-high {{
-                font-family: "JetBrains Mono", monospace;
-                font-size: 9px;
-                font-weight: 700;
-                color: var(--bear);
-                border: 1px solid rgba(248, 113, 113, 0.25);
-                padding: 4px 7px;
-                border-radius: 4px;
-                letter-spacing: 0.05em;
-            }}
-            .priority-normal {{
-                font-family: "JetBrains Mono", monospace;
-                font-size: 9px;
+            .rating-page-status {{
+                min-width: 78px;
+                text-align: center;
+                font: 11px "JetBrains Mono", monospace;
                 color: var(--text-secondary);
-                border: 1px solid var(--border);
-                padding: 4px 7px;
-                border-radius: 4px;
-                letter-spacing: 0.05em;
             }}
+            
+            /* Table：基础表格样式来自 design_system，这里只补首页特有的列宽与密度 */
+            .rating-table {{ min-width: 880px; }}
+            .rating-table .cell-dot {{ width: 26px; padding-right: 0; }}
+            .rating-table .cell-bank {{ color: var(--text-secondary); white-space: nowrap; }}
+            .rating-table .cell-rating {{ white-space: nowrap; }}
+            .rating-table .cell-pt {{ white-space: nowrap; }}
+            .rating-table .cell-evidence {{ width: 96px; }}
+            .rating-table tbody td {{ padding: 13px 14px; }}
+            .rating-time {{ white-space: nowrap; }}
+            .reaction-table-wrap table {{ min-width: 860px; }}
+            .pt-empty {{ color: var(--text-tertiary); cursor: help; }}
             .analysis-text {{
                 color: var(--text-secondary);
                 line-height: 1.85;
                 font-size: 15px;
                 white-space: pre-line;
             }}
+            .digest-panel {{
+                display: grid;
+                grid-template-columns: minmax(0, 1.75fr) minmax(240px, .75fr);
+                gap: 24px;
+                align-items: start;
+                padding: 24px 28px;
+            }}
+            .digest-main {{
+                min-width: 0;
+            }}
+            .digest-label {{
+                margin-bottom: 14px;
+                color: var(--gold);
+                font-family: var(--font-mono);
+                font-size: 10.5px;
+                font-weight: 700;
+                letter-spacing: .14em;
+                text-transform: uppercase;
+            }}
+            .digest-risks {{
+                padding-left: 26px;
+                border-left: 1px solid var(--border-strong);
+            }}
+            .digest-risks .risk-item {{
+                margin-bottom: 14px;
+                padding-left: 18px;
+                font-size: 13.5px;
+                line-height: 1.75;
+            }}
+
+            /* Institution intelligence */
+            .institution-grid {{
+                display: grid;
+                grid-template-columns: repeat(2, minmax(0, 1fr));
+                gap: 16px;
+            }}
+            .institution-card {{
+                position: relative;
+                overflow: hidden;
+                padding: 22px;
+                border: 1px solid var(--border);
+                border-radius: var(--radius-md);
+                background: var(--surface);
+                box-shadow: var(--shadow-sm);
+            }}
+            .institution-card::after {{
+                content: "";
+                position: absolute;
+                right: -32px;
+                bottom: -52px;
+                width: 130px;
+                height: 130px;
+                border: 1px solid var(--border);
+                border-radius: 50%;
+            }}
+            .institution-card-head {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                margin-bottom: 14px;
+            }}
+            .institution-card-head > a {{
+                color: var(--text);
+                font-family: var(--font-serif);
+                font-size: 20px;
+                text-decoration: none;
+            }}
+            .institution-stats {{
+                display: flex;
+                flex-wrap: wrap;
+                gap: 7px 14px;
+                margin-bottom: 13px;
+                color: var(--text-secondary);
+                font-family: "JetBrains Mono", monospace;
+                font-size: 11px;
+            }}
+            .institution-card p {{
+                min-height: 46px;
+                margin: 0 0 14px;
+                color: var(--text-secondary);
+                font-size: 13px;
+                line-height: 1.75;
+            }}
+            .institution-card-foot {{
+                display: flex;
+                justify-content: space-between;
+                gap: 12px;
+                color: var(--text-tertiary);
+                font-size: 11px;
+            }}
+            .institution-symbols {{ display: flex; flex-wrap: wrap; gap: 7px; }}
+            .institution-symbols a {{ color: var(--gold); text-decoration: none; }}
+            .tone-badge {{
+                display: inline-flex;
+                align-items: center;
+                padding: 4px 8px;
+                border: 1px solid var(--border);
+                border-radius: 999px;
+                font-size: 10px;
+                line-height: 1;
+                white-space: nowrap;
+            }}
+            .tone-bull, .bull-text {{ color: var(--bull); }}
+            .tone-bear, .bear-text {{ color: var(--bear); }}
+            .tone-mixed {{ color: var(--neutral); }}
+            .reaction-state {{
+                display: inline-flex;
+                padding: 5px 9px;
+                border-radius: 999px;
+                font-size: 10px;
+                white-space: nowrap;
+            }}
+            .reaction-aligned {{ color: var(--bull); background: rgba(74,222,128,.09); }}
+            .reaction-diverged {{ color: var(--bear); background: rgba(248,113,113,.09); }}
+            .reaction-mixed {{ color: var(--neutral); background: rgba(251,191,36,.09); }}
+            .reaction-pending {{ color: var(--text-secondary); background: var(--surface-2); }}
+            .reaction-table-wrap a {{ color: var(--text); text-decoration: none; }}
+            .reaction-table-wrap a:hover {{ color: var(--gold); }}
+            .evidence-boundary {{
+                margin-top: 16px;
+                padding: 16px 18px;
+                border: 1px dashed var(--border-strong);
+                border-radius: var(--radius-sm);
+                color: var(--text-secondary);
+                font-size: 12px;
+                line-height: 1.75;
+            }}
+            .evidence-boundary a {{ color: var(--gold); }}
             
             /* Asset grid */
             .asset-grid {{
@@ -2393,6 +2580,9 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 .wrap {{ padding: 36px 20px 70px; }}
                 .hero {{ grid-template-columns: 1fr; gap: 40px; }}
                 .split-grid {{ grid-template-columns: 1fr; }}
+                .digest-panel {{ grid-template-columns: 1fr; }}
+                .digest-risks {{ padding: 22px 0 0; border-left: 0; border-top: 1px solid var(--border-strong); }}
+                .institution-grid {{ grid-template-columns: 1fr; }}
                 .topbar {{ flex-direction: column; align-items: flex-start; }}
                 .refresh-controls {{ justify-content: flex-start; width: 100%; }}
                 .update-time {{ text-align: left; flex-basis: 100%; }}
@@ -2402,7 +2592,10 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             @media (max-width: 640px) {{
                 .hero-title {{ font-size: clamp(36px, 12vw, 56px); }}
                 .asset-grid {{ grid-template-columns: 1fr; }}
+                .institution-card-foot {{ flex-direction: column; }}
                 .rating-toolbar {{ flex-direction: column; align-items: flex-start; }}
+                .rating-toolbar-cluster {{ align-items: flex-start; }}
+                .rating-pagination-top {{ width: 100%; justify-content: flex-start; }}
                 .bmc-panel, .contact-panel {{ flex-direction: column; align-items: flex-start; }}
                 table {{ font-size: 13px; }}
                 tbody td {{ padding: 14px 12px; }}
@@ -2463,112 +2656,123 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     <div class="wrap">
         {homepage_nav_html()}
         <header class="topbar reveal">
-            <div class="edition">Foreign Investment Bank Research · {safe_date_range}</div>
+            <div class="edition">Sell-side research pulse · {safe_date_range}</div>
             <div class="refresh-controls">
                 {manual_refresh_html}
                 {x_profile_link_html}
-                <div class="theme-switcher" role="group" aria-label="切换主题">
-                    <button type="button" class="theme-btn active" data-theme="dark" onclick="setTheme('dark')" title="暗色" aria-label="暗色主题"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
-                    <button type="button" class="theme-btn" data-theme="light" onclick="setTheme('light')" title="明亮" aria-label="明亮主题"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><line x1="12" y1="1" x2="12" y2="4"/><line x1="12" y1="20" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="4" y2="12"/><line x1="20" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg></button>
-                    <button type="button" class="theme-btn" data-theme="sepia" onclick="setTheme('sepia')" title="护眼" aria-label="护眼主题"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
-                </div>
                 <span class="update-time" id="updateTime"></span>
             </div>
         </header>
 
         <div class="auto-refresh-note reveal">
             <span class="pulse"></span>
-            系统每 4 小时采集并刷新分析 · 每日开盘前完整重算
+            外资投行评级与目标价每 4 小时更新 · 每日补齐市场验证
         </div>
         {degraded_banner_html}
 
         <div id="generatedAt" data-time="{safe_generated_at_attr}" style="display:none"></div>
 
         <section class="hero reveal reveal-delay-1">
-            <div>
-                <h1 class="hero-title serif">AI 金融<em>研究</em>平台</h1>
-                <p class="hero-sub">
-                    FResearch 追踪外资投行对 AI 算力、半导体与数据中心主线的评级、目标价与研报变动。
-                    覆盖 {len(coverage_banks)} 家主要外资机构，排除中国本土投行；
-                    由内部聚合分析引擎基于 {len(meta.get('data_sources', []))} 个数据源做结构化摘要。
-                    每只关注股票、每个主题和每条研究方法都有独立可索引 URL。
-                </p>
-                {f'<div class="bank-strip">{bank_bubbles}</div>' if bank_bubbles else ''}
-                <div class="stock-strip" aria-label="关注股票">{stock_strip}</div>
-            </div>
-            <div class="meta-grid">
-                <div class="meta-item">
-                    <div class="meta-label">Institution</div>
-                    <div class="meta-value">{safe_institution}</div>
-                </div>
-                <div class="meta-item">
-                    <div class="meta-label">Date Range</div>
-                    <div class="meta-value">{safe_date_range}</div>
-                </div>
-                <div class="meta-item">
-                    <div class="meta-label">Generated At</div>
-                    <div class="meta-value mono">{safe_generated_at} <span class="muted">({safe_refresh_mode})</span></div>
-                </div>
-                <div class="meta-item">
-                    <div class="meta-label">Data Points</div>
-                    <div class="meta-value mono">{news_count} news / {rec_count} recs</div>
-                </div>
-                <div class="meta-item">
-                    <div class="meta-label">Assets Covered</div>
-                    <div class="meta-value" style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;">{assets_html if assets_html else '<span class="muted">—</span>'}</div>
-                </div>
-            </div>
+            <h1 class="hero-title serif">投行目标价、<em>研报观点</em><br>与市场验证</h1>
+            <p class="hero-sub">
+                汇总 Goldman Sachs、Morgan Stanley、JPMorgan 等机构对关注股票的评级、目标价与公开研报观点；
+                合并同一标的的机构共识与分歧，再追踪观点发布后 1、5、20 个交易日相对 SPY 的表现。
+            </p>
+            <p class="hero-boundary">“市场确认 / 未确认”只描述公开观点与后续价格的关系，不推断未披露的持仓或交易意图。</p>
+            {coverage_html}
         </section>
+
+        <div class="hero-metrics reveal reveal-delay-2">
+            <div class="meta-item">
+                <div class="meta-label">覆盖机构</div>
+                <div class="meta-value mono">{institution_count}</div>
+            </div>
+            <div class="meta-item">
+                <div class="meta-label">关注池 / 全部事件</div>
+                <div class="meta-value mono">{tracked_change_count} <span class="muted">/ {total_change_count}</span></div>
+            </div>
+            <div class="meta-item">
+                <div class="meta-label">已验证目标价</div>
+                <div class="meta-value mono">{verified_target_count}</div>
+            </div>
+            <div class="meta-item">
+                <div class="meta-label">方向性验证样本</div>
+                <div class="meta-value mono">{evaluated_event_count} <span class="muted">/ {tracked_event_count}</span></div>
+            </div>
+            <div class="meta-item">
+                <div class="meta-label">数据截至</div>
+                <div class="meta-value mono is-small">{safe_generated_at} <span class="muted">({safe_refresh_mode})</span></div>
+            </div>
+        </div>
 
         <section class="section reveal reveal-delay-2">
             <div class="section-head">
-                <span class="section-title">Core Thesis</span>
+                <h2 class="section-title">本期研报观点整合</h2>
                 <span class="section-count">01</span>
             </div>
-            <div class="panel">
-                <div class="thesis serif">{safe_core_thesis}</div>
+            <div class="panel digest-panel">
+                <div class="digest-main">
+                    <div class="digest-label">公开观点摘要</div>
+                    <div class="thesis">{safe_core_thesis}</div>
+                </div>
+                <aside class="digest-risks">
+                    <div class="digest-label">主要分歧与待验证风险</div>
+                    {_render_tail_risks(tail_risks)}
+                </aside>
             </div>
         </section>
 
-        <section class="section reveal reveal-delay-3">
+        <section class="section reveal reveal-delay-3" id="latest-calls">
             <div class="section-head">
-                <span class="section-title">Rating Changes</span>
-                <span class="section-count">{len(changes):02d}</span>
+                <h2 class="section-title">最新评级与目标价动作</h2>
+                <span class="section-count" id="ratingSectionCount">近 30 天 · 关注池 · 共 {tracked_change_count} 条</span>
             </div>
             {analysis_panel_html}
             <div class="rating-toolbar" aria-label="评级变化视图设置">
-                <div class="rating-toolbar-group">
-                    <span class="rating-toolbar-label">时间范围</span>
-                    <div class="rating-segment" role="group" aria-label="筛选最近天数">
-                        <button class="rating-control" type="button" data-rating-days="7" onclick="setRatingWindow(7)">7 天</button>
-                        <button class="rating-control" type="button" data-rating-days="14" onclick="setRatingWindow(14)">14 天</button>
-                        <button class="rating-control active" type="button" data-rating-days="30" onclick="setRatingWindow(30)">30 天</button>
+                <div class="rating-toolbar-cluster">
+                    <div class="rating-toolbar-group">
+                        <span class="rating-toolbar-label">股票范围</span>
+                        <div class="rating-segment" role="group" aria-label="筛选股票范围">
+                            <button class="rating-control active" type="button" data-rating-universe="tracked" aria-pressed="true" onclick="setRatingUniverse('tracked')">关注池 {tracked_change_count}</button>
+                            <button class="rating-control" type="button" data-rating-universe="all" aria-pressed="false" onclick="setRatingUniverse('all')">全部事件 {total_change_count}</button>
+                        </div>
+                    </div>
+                    <div class="rating-toolbar-group">
+                        <span class="rating-toolbar-label">时间范围</span>
+                        <div class="rating-segment" role="group" aria-label="筛选最近天数">
+                            <button class="rating-control" type="button" data-rating-days="7" aria-pressed="false" onclick="setRatingWindow(7)">7 天</button>
+                            <button class="rating-control" type="button" data-rating-days="14" aria-pressed="false" onclick="setRatingWindow(14)">14 天</button>
+                            <button class="rating-control active" type="button" data-rating-days="30" aria-pressed="true" onclick="setRatingWindow(30)">30 天</button>
+                        </div>
                     </div>
                 </div>
                 <div class="rating-toolbar-group">
                     <span class="rating-toolbar-label">排序</span>
                     <div class="rating-segment" role="group" aria-label="评级排序方式">
-                        <button class="rating-control active" type="button" data-rating-sort="time" onclick="setRatingSort('time')">按时间</button>
-                        <button class="rating-control" type="button" data-rating-sort="symbol" onclick="setRatingSort('symbol')">按个股</button>
+                        <button class="rating-control active" type="button" data-rating-sort="time" aria-pressed="true" onclick="setRatingSort('time')">按时间</button>
+                        <button class="rating-control" type="button" data-rating-sort="symbol" aria-pressed="false" onclick="setRatingSort('symbol')">按个股</button>
                     </div>
-                    <span class="rating-visible-count" id="ratingVisibleCount">0 条</span>
-                    <span class="rating-visible-count">* 为首次记录日</span>
+                    <span class="rating-visible-count" id="ratingVisibleCount">{default_range}</span>
+                    <span class="rating-visible-count">数据截至 {_safe_text(report_as_of or generated_at[:10])} · 最新事件 {_safe_text(latest_rating_date or '—')}</span>
+                    <nav class="rating-pagination rating-pagination-top" data-rating-pagination{default_pagination_hidden} aria-label="评级事件顶部分页">
+                        <button class="rating-page-btn" type="button" id="ratingPrevTop" data-rating-page-prev aria-label="上一页" title="上一页" onclick="changeRatingPage(-1)" disabled>←</button>
+                        <span class="rating-page-status" id="ratingPageStatusTop" data-rating-page-status aria-live="polite">1 / {default_pages}</span>
+                        <button class="rating-page-btn" type="button" id="ratingNextTop" data-rating-page-next aria-label="下一页" title="下一页" onclick="changeRatingPage(1)">→</button>
+                    </nav>
                 </div>
             </div>
             <div class="table-wrap reveal">
-                <table>
+                <table class="rating-table">
                     <thead>
                         <tr>
-                            <th></th>
-                            <th>Symbol</th>
-                            <th>Bank</th>
-                            <th>Action</th>
-                            <th>Old</th>
-                            <th></th>
-                            <th>New</th>
-                            <th>Target</th>
-                            <th>Time</th>
-                            <th>Priority</th>
+                            <th><span class="sr-only">方向</span></th>
+                            <th>股票</th>
+                            <th>机构</th>
+                            <th>公开动作</th>
+                            <th>评级变化</th>
+                            <th>目标价</th>
+                            <th>日期</th>
+                            <th>来源</th>
                         </tr>
                     </thead>
                     <tbody id="ratingTableBody">
@@ -2576,11 +2780,23 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                     </tbody>
                 </table>
             </div>
+            <script type="application/json" id="ratingLedger">{rating_ledger_json}</script>
+            <nav class="rating-pagination" id="ratingPagination" data-rating-pagination{default_pagination_hidden} aria-label="评级事件底部分页">
+                <button class="rating-page-btn" type="button" id="ratingPrev" data-rating-page-prev onclick="changeRatingPage(-1)" disabled>上一页</button>
+                <span class="rating-page-status" id="ratingPageStatus" data-rating-page-status aria-live="polite">第 1 / {default_pages} 页</span>
+                <button class="rating-page-btn" type="button" id="ratingNext" data-rating-page-next onclick="changeRatingPage(1)">下一页</button>
+            </nav>
+            <div class="evidence-boundary">
+                完整保留近 30 日 {total_change_count} 条评级与目标价事件，其中关注池 {tracked_change_count} 条；默认只看关注池，每页 30 条。
+                「来源」列只标注可回溯的已验证或公开标题事件，留空表示尚未补齐来源。日期后的 * 表示首次记录日。可前往
+                <a href="/stocks/">股票目标价</a>或<a href="/institutions/">机构观点</a>
+                查看按标的、机构聚合后的完整上下文。
+            </div>
         </section>
 
-        <section class="section reveal reveal-delay-4">
+        <section class="section reveal reveal-delay-4" id="price-targets">
             <div class="section-head">
-                <span class="section-title">Asset Targets</span>
+                <h2 class="section-title">股票目标价快照</h2>
                 <span class="section-count">{len(asset_targets):02d}</span>
             </div>
             <div class="asset-grid">
@@ -2588,41 +2804,39 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             </div>
         </section>
 
-        <section class="section reveal reveal-delay-4">
+        <section class="section reveal reveal-delay-4" id="institution-views">
             <div class="section-head">
-                <span class="section-title">Macro Variables</span>
-                <span class="section-count">EXP</span>
+                <h2 class="section-title">机构公开倾向与观点蒸馏</h2>
+                <span class="section-count">{institution_count:02d}</span>
             </div>
-            <div class="panel">
-                {macro_html}
+            <p class="section-intro">把同一机构近 30 天对关注池股票的评级、目标价动作合并，再看这些公开表态有没有得到后续价格确认。</p>
+            <div class="institution-grid">
+                {institution_cards_html}
             </div>
         </section>
 
-        <div class="split-grid reveal reveal-delay-5">
-            <section class="section">
-                <div class="section-head">
-                    <span class="section-title">Statistical Evidence</span>
-                    <span class="section-count">02</span>
-                </div>
-                <div class="panel">
-                    <div class="evidence-text">{safe_stat_evidence}</div>
-                </div>
-            </section>
-
-            <section class="section">
-                <div class="section-head">
-                    <span class="section-title">Tail Risks</span>
-                    <span class="section-count">03</span>
-                </div>
-                <div class="panel">
-                    {_render_tail_risks(tail_risks)}
-                </div>
-            </section>
-        </div>
+        <section class="section reveal reveal-delay-5" id="market-reactions">
+            <div class="section-head">
+                <h2 class="section-title">机构观点后的市场反应</h2>
+                <span class="section-count">方向样本 {evaluated_event_count:02d}</span>
+            </div>
+            <p class="section-intro">相对表现以 SPY 为基准，从事件前一交易日收盘近似计算；事件只有日期时，无法区分盘前与盘后。</p>
+            <div class="table-wrap reaction-table-wrap">
+                <table>
+                    <thead><tr><th>机构</th><th>股票</th><th>公开观点</th><th>目标价</th><th>相对表现</th><th>市场验证</th><th>日期</th></tr></thead>
+                    <tbody>{reaction_rows_html}</tbody>
+                </table>
+            </div>
+            <div class="evidence-boundary">
+                <b>如何理解：</b>“公开偏多但市场未确认”只说明观点方向与随后相对收益不一致。
+                卖方研究、交易、投行与资管部门可能相互独立，这不是对出货、抄底或操纵意图的认定。
+                <a href="/methodology/">查看完整口径</a>
+            </div>
+        </section>
 
         <footer class="footer reveal reveal-delay-5">
             <div>
-                数据来源: {sources_html} · AI 摘要: 内部聚合分析引擎 · 框架: 对冲基金量化研究标准
+                数据来源: {sources_html} · 处理: 公开来源归集、事件去重、目标价分级与市场反应计算
             </div>
             <div style="text-align:right;">
                 本报告仅供信息参考，不构成投资建议
@@ -2654,9 +2868,11 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
 
         <!-- Compliance Disclaimer -->
         <div class="disclaimer-panel reveal reveal-delay-5">
-            <div class="disclaimer-title">Disclaimer</div>
+            <div class="disclaimer-title">研究边界与免责声明</div>
             <div class="disclaimer-body">
-                Fresearch is a research and information software platform. We do not provide investment advisory, brokerage, asset management, or trade execution services. Information provided by the platform is for research and educational purposes only and does not constitute investment advice.
+                FResearch 基于公开新闻标题、评级、目标价字段与可公开摘要进行归集，不复述受版权保护的完整研报。
+                机构公开评级不能证明其持仓或交易方向；“市场确认 / 未确认”仅描述事件后的价格表现。
+                本站不提供投资顾问、经纪、资产管理或交易执行服务，所有内容仅供研究与教育用途，不构成投资建议。
             </div>
         </div>
         {homepage_footer_nav_html()}
@@ -2726,56 +2942,107 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             t.classList.add('show');
             setTimeout(() => t.classList.remove('show'), 3200);
         }}
-        const ratingView = {{ days: 30, sort: 'time' }};
-        function ratingDateValue(row) {{
-            const value = row.dataset.date || '';
-            if (!/^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(value)) return null;
-            const parsed = new Date(value + 'T00:00:00');
-            return Number.isNaN(parsed.getTime()) ? null : parsed;
+        const RATING_AS_OF = {json.dumps(report_as_of)};
+        const ratingView = {{ universe: 'tracked', days: 30, sort: 'time', page: 1, pageSize: 30 }};
+        // 账本以预渲染好的 <tr> 字符串形式传下来：DOM 里只保留当前一页，
+        // 切换视图仍然是纯前端的，不用再请求服务端。
+        // 首屏那一页已由服务端渲染，所以这份 JSON 直到用户第一次操作筛选
+        // 或翻页时才解析，不占用加载时的主线程。
+        let ratingLedgerCache = null;
+        function ratingLedger() {{
+            if (ratingLedgerCache) return ratingLedgerCache;
+            const node = document.getElementById('ratingLedger');
+            try {{
+                ratingLedgerCache = (node && JSON.parse(node.textContent)) || [];
+            }} catch (e) {{
+                ratingLedgerCache = [];
+            }}
+            return ratingLedgerCache;
+        }}
+        function ratingAnchorDate(ledger) {{
+            if (/^\\d{{4}}-\\d{{2}}-\\d{{2}}$/.test(RATING_AS_OF)) return RATING_AS_OF;
+            const dates = ledger.map(item => item.d).filter(Boolean);
+            if (dates.length) return dates.reduce((a, b) => (a > b ? a : b));
+            return new Date().toISOString().slice(0, 10);
         }}
         function applyRatingView() {{
             const tbody = document.getElementById('ratingTableBody');
             if (!tbody) return;
-            const rows = Array.from(tbody.querySelectorAll('.rating-row'));
-            const emptyRow = document.getElementById('ratingFilterEmpty');
-            rows.sort((a, b) => {{
-                const dateOrder = (b.dataset.date || '').localeCompare(a.dataset.date || '');
-                const symbolOrder = (a.dataset.symbol || '').localeCompare(b.dataset.symbol || '', 'en');
-                const bankOrder = (a.dataset.bank || '').localeCompare(b.dataset.bank || '', 'zh-CN');
-                if (ratingView.sort === 'symbol') return symbolOrder || dateOrder || bankOrder;
-                return dateOrder || symbolOrder || bankOrder;
-            }});
+            const ledger = ratingLedger();
 
-            const cutoff = new Date();
-            cutoff.setHours(0, 0, 0, 0);
-            cutoff.setDate(cutoff.getDate() - (ratingView.days - 1));
-            let visibleCount = 0;
-            let previousSymbol = null;
-            rows.forEach(row => {{
-                const eventDate = ratingDateValue(row);
-                const visible = eventDate ? eventDate >= cutoff : ratingView.days === 30;
-                row.hidden = !visible;
-                row.classList.remove('group-start');
-                if (visible) {{
-                    visibleCount += 1;
-                    if (ratingView.sort === 'symbol' && row.dataset.symbol !== previousSymbol) {{
+            let scoped = ratingView.universe === 'tracked'
+                ? ledger.filter(item => item.t === 1)
+                : ledger.slice();
+            if (ratingView.days !== 30) {{
+                const anchor = new Date(ratingAnchorDate(ledger) + 'T00:00:00');
+                anchor.setDate(anchor.getDate() - (ratingView.days - 1));
+                const cutoff = anchor.toISOString().slice(0, 10);
+                scoped = scoped.filter(item => item.d && item.d >= cutoff);
+            }}
+            if (ratingView.sort === 'symbol') {{
+                scoped.sort((a, b) => (a.s || '').localeCompare(b.s || '', 'en')
+                    || (b.d || '').localeCompare(a.d || ''));
+            }}
+
+            const total = scoped.length;
+            const totalPages = Math.max(1, Math.ceil(total / ratingView.pageSize));
+            ratingView.page = Math.min(Math.max(1, ratingView.page), totalPages);
+            const start = (ratingView.page - 1) * ratingView.pageSize;
+            const pageItems = scoped.slice(start, start + ratingView.pageSize);
+
+            if (total === 0) {{
+                tbody.innerHTML = '<tr id="ratingFilterEmpty"><td colspan="8" class="empty-cell">该时间段暂无评级变动</td></tr>';
+            }} else {{
+                tbody.innerHTML = pageItems.map(item => item.h).join('');
+            }}
+            if (ratingView.sort === 'symbol') {{
+                let previousSymbol = null;
+                Array.from(tbody.querySelectorAll('.rating-row')).forEach(row => {{
+                    if (row.dataset.symbol !== previousSymbol) {{
                         row.classList.add('group-start');
                         previousSymbol = row.dataset.symbol;
                     }}
-                }}
-                tbody.appendChild(row);
-            }});
-            if (emptyRow) {{
-                emptyRow.hidden = visibleCount !== 0;
-                tbody.appendChild(emptyRow);
+                }});
             }}
+
+            const from = total ? start + 1 : 0;
+            const to = Math.min(start + ratingView.pageSize, total);
             const counter = document.getElementById('ratingVisibleCount');
-            if (counter) counter.textContent = `${{visibleCount}} 条`;
+            if (counter) counter.textContent = total ? `${{from}}–${{to}} / 共 ${{total}} 条` : '共 0 条';
+            const sectionCount = document.getElementById('ratingSectionCount');
+            const universeLabel = ratingView.universe === 'tracked' ? '关注池' : '全部已收录';
+            if (sectionCount) sectionCount.textContent = `近 ${{ratingView.days}} 天 · ${{universeLabel}} · 共 ${{total}} 条`;
+            document.querySelectorAll('[data-rating-pagination]').forEach(pagination => {{
+                pagination.hidden = totalPages <= 1;
+            }});
+            document.querySelectorAll('[data-rating-page-status]').forEach((pageStatus, index) => {{
+                pageStatus.textContent = total
+                    ? (index === 0 ? `${{ratingView.page}} / ${{totalPages}}` : `第 ${{ratingView.page}} / ${{totalPages}} 页`)
+                    : '';
+            }});
+            document.querySelectorAll('[data-rating-page-prev]').forEach(button => {{
+                button.disabled = ratingView.page <= 1;
+            }});
+            document.querySelectorAll('[data-rating-page-next]').forEach(button => {{
+                button.disabled = ratingView.page >= totalPages;
+            }});
+            scheduleVisibleLogoRefresh();
+        }}
+        function setRatingUniverse(universe) {{
+            ratingView.universe = universe === 'tracked' ? 'tracked' : 'all';
+            ratingView.page = 1;
+            document.querySelectorAll('[data-rating-universe]').forEach(button => {{
+                const active = button.dataset.ratingUniverse === ratingView.universe;
+                button.classList.toggle('active', active);
+                button.setAttribute('aria-pressed', active ? 'true' : 'false');
+            }});
+            applyRatingView();
         }}
         function setRatingWindow(days) {{
-            ratingView.days = days;
+            ratingView.days = [7, 14, 30].includes(days) ? days : 30;
+            ratingView.page = 1;
             document.querySelectorAll('[data-rating-days]').forEach(button => {{
-                const active = Number(button.dataset.ratingDays) === days;
+                const active = Number(button.dataset.ratingDays) === ratingView.days;
                 button.classList.toggle('active', active);
                 button.setAttribute('aria-pressed', active ? 'true' : 'false');
             }});
@@ -2783,11 +3050,16 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         }}
         function setRatingSort(mode) {{
             ratingView.sort = mode === 'symbol' ? 'symbol' : 'time';
+            ratingView.page = 1;
             document.querySelectorAll('[data-rating-sort]').forEach(button => {{
                 const active = button.dataset.ratingSort === ratingView.sort;
                 button.classList.toggle('active', active);
                 button.setAttribute('aria-pressed', active ? 'true' : 'false');
             }});
+            applyRatingView();
+        }}
+        function changeRatingPage(delta) {{
+            ratingView.page += Number(delta) || 0;
             applyRatingView();
         }}
         async function refreshData(mode = 'full') {{
@@ -2831,8 +3103,19 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             else text = `${{Math.floor(hours/24)}} 天前`;
             out.textContent = text;
         }}
+        let pendingLogoRefreshTimer = null;
+        function visiblePendingLogos() {{
+            return Array.from(document.querySelectorAll('img[data-logo-pending="1"]')).filter(img => {{
+                const ratingRow = img.closest('.rating-row');
+                return !ratingRow || !ratingRow.hidden;
+            }});
+        }}
+        function scheduleVisibleLogoRefresh(delay = 250) {{
+            if (pendingLogoRefreshTimer) clearTimeout(pendingLogoRefreshTimer);
+            pendingLogoRefreshTimer = setTimeout(() => refreshPendingLogos(), delay);
+        }}
         async function refreshPendingLogos(attempt = 0) {{
-            const pending = Array.from(document.querySelectorAll('img[data-logo-pending="1"]'));
+            const pending = visiblePendingLogos();
             if (!pending.length || attempt >= 4) return;
             const groups = new Map();
             pending.forEach(img => {{
@@ -2857,7 +3140,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                     // 下一轮自动重试；不打断页面其它功能。
                 }}
             }}));
-            if (document.querySelector('img[data-logo-pending="1"]')) {{
+            if (visiblePendingLogos().length) {{
                 const delays = [3500, 8000, 16000, 30000];
                 setTimeout(() => refreshPendingLogos(attempt + 1), delays[attempt]);
             }}
@@ -2874,9 +3157,10 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             try {{ saved = localStorage.getItem('ib-theme') || 'dark'; }} catch (e) {{}}
             setTheme(saved);
         }})();
-        applyRatingView();
+        // 首屏的行、计数与分页状态都由服务端给出，加载时不调 applyRatingView，
+        // 于是 1MB 级的账本 JSON 完全不进首屏关键路径。
+        scheduleVisibleLogoRefresh();
         updateRelativeTime();
-        setTimeout(() => refreshPendingLogos(), 2000);
         setInterval(updateRelativeTime, 60000);
         document.addEventListener('keydown', e => {{
             if (document.getElementById('refreshBtnFast') && (e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'r') {{

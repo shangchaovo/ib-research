@@ -62,6 +62,7 @@ class YahooProvider:
     TTL_FUNDAMENTALS = 21600  # 6 h
     TTL_CALENDAR = 21600   # 6 h
     TTL_RECS = 21600       # 6 h
+    TTL_HISTORY = 21600    # 6 h
 
     def __init__(self):
         _setup_proxy()
@@ -101,6 +102,63 @@ class YahooProvider:
 
     def quotes(self, symbols: list[str]) -> dict[str, dict]:
         return {s: q for s in symbols if (q := self.quote(s))}
+
+    def market_history(self, symbols: list[str], period: str = "3mo") -> dict[str, list[dict]]:
+        """批量获取复权日线收盘价，供评级事件后的市场反应分析使用。
+
+        返回 ``{symbol: [{date: YYYY-MM-DD, close: float}, ...]}``。批量请求
+        比逐股调用更轻量；任何 Yahoo 异常均静默降级为空或部分结果。
+        """
+        normalized = list(dict.fromkeys(
+            str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()
+        ))
+        if not normalized:
+            return {}
+        key = f"history:{','.join(normalized)}:{period}"
+        cached = self._cache.get(key, self.TTL_HISTORY)
+        if cached is not None:
+            return cached
+        try:
+            import yfinance as yf
+
+            frame = yf.download(
+                tickers=normalized,
+                period=period,
+                interval="1d",
+                auto_adjust=True,
+                actions=False,
+                progress=False,
+                threads=True,
+                group_by="column",
+            )
+            if frame is None or frame.empty:
+                return {}
+
+            out: dict[str, list[dict]] = {}
+            for symbol in normalized:
+                series = None
+                if isinstance(frame.columns, pd.MultiIndex):
+                    if ("Close", symbol) in frame.columns:
+                        series = frame[("Close", symbol)]
+                    elif (symbol, "Close") in frame.columns:
+                        series = frame[(symbol, "Close")]
+                elif len(normalized) == 1 and "Close" in frame.columns:
+                    series = frame["Close"]
+                if series is None:
+                    continue
+                rows = []
+                for stamp, value in series.dropna().items():
+                    close = _safe_float(value)
+                    if close is None or close <= 0:
+                        continue
+                    date = stamp.strftime("%Y-%m-%d") if hasattr(stamp, "strftime") else str(stamp)[:10]
+                    rows.append({"date": date, "close": round(close, 4)})
+                if rows:
+                    out[symbol] = rows
+            self._cache.set(key, out)
+            return out
+        except Exception:
+            return {}
 
     # ── 新闻 ──
     def news(self, symbol: str, limit: int = 5) -> list[dict]:

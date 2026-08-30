@@ -35,6 +35,8 @@ CHECKS = [
     ("llms", "/llms.txt", lambda s, h: "FResearch" in s),
     ("og_png", "/og-image.png", lambda s, h: h.get("Content-Type", "").startswith("image/png")),
     ("stock_page", "/stocks/nvda/", lambda s, h: GSC_TOKEN in s and "<title>" in s),
+    ("institutions", "/institutions/", lambda s, h: "机构观点、目标价与市场验证" in s and "<title>" in s),
+    ("reactions", "/reactions/", lambda s, h: "投行观点发布后的市场反应" in s and "<title>" in s),
 ]
 
 

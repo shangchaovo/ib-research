@@ -40,14 +40,14 @@ def main():
     d.text((72, 74), "F R E S E A R C H", font=font(GEORGIA, 30), fill=SUB)
     d.line([(72, 128), (W - 72, 128)], fill=LINE, width=2)
 
-    # 主标题(衬线, 金+白)
-    d.text((72, 190), "AI 金融研究平台", font=font(SONGTI, 118), fill=GOLD)
-    d.text((72, 348), "Foreign Investment Bank Research, Distilled.",
-           font=font(GEORGIA_B, 44), fill=TEXT)
+    # 主标题：与站内核心定位保持一致——目标价、公开观点、事后验证。
+    d.text((72, 184), "投行目标价与观点验证", font=font(SONGTI, 82), fill=GOLD)
+    d.text((72, 326), "What they said. What the market did.",
+           font=font(GEORGIA_B, 43), fill=TEXT)
 
     # 副标题
-    d.text((72, 432), "投行研报 · 评级追踪 · 目标价 · AI 算力与半导体主线",
-           font=font(HIRAGINO, 34), fill=SUB)
+    d.text((72, 422), "评级与目标价 · 机构观点 · 1 / 5 / 20 日市场反应",
+           font=font(HIRAGINO, 32), fill=SUB)
 
     # 底部 ticker chips
     tickers = ["NVDA", "TSM", "AVGO", "MSFT", "MU", "ASML", "AMD", "ANET"]
