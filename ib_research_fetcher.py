@@ -4433,6 +4433,28 @@ def _ensure_ib_research_server_running():
         print(f"  -> 启动 IB Research server 失败: {e}")
 
 
+def _trigger_cloudflare_publish() -> None:
+    """数据落盘后异步发布静态快照；发布失败不影响采集结果。"""
+    if os.environ.get("IB_RESEARCH_CLOUDFLARE_PUBLISH", "1").strip().lower() in {
+        "0", "false", "no", "off"
+    }:
+        return
+    publisher = os.path.join(os.path.dirname(__file__), "publish_cloudflare.py")
+    if not os.path.isfile(publisher):
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, publisher],
+            cwd=os.path.dirname(__file__),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        print("  -> Cloudflare 静态快照已进入后台发布队列")
+    except Exception as exc:
+        print(f"  -> Cloudflare 发布进程启动失败: {exc}")
+
+
 def _validate_report(report: Dict[str, Any]) -> List[str]:
     """数据质量检查，返回问题列表（空列表表示通过）"""
     issues = []
@@ -4571,6 +4593,8 @@ if __name__ == "__main__":
     report = run_fetch(force=args.force, fast=args.fast)
     if _watchdog is not None:
         _watchdog.cancel()
+    if report.get("meta", {}).get("quality_status") == "ok":
+        _trigger_cloudflare_publish()
     print("\n=== 报告摘要 ===")
     summary = report.get("summary", {})
     if isinstance(summary, dict):

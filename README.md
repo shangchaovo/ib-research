@@ -8,7 +8,7 @@
 
 采集大约四小时一轮，行情验证每天补。韩股那边会跟一下海力士、三星的本土券商目标价。首页默认看关注池近 30 天；点进股票页能看到现价对一致目标价、公开目标价区间和机构时间线。
 
-> `git push` 只更新 GitHub。公网站点由本机 `8081` 经 Cloudflare Tunnel 对外；代码要上线请跑 `bash deploy.sh`。
+> `git push` 只更新 GitHub。公网站点由 Cloudflare Workers Static Assets 提供；本机负责采集并自动发布只读快照。代码上线请跑 `bash deploy.sh`。
 
 ## 功能
 
@@ -70,17 +70,18 @@ python3 ib_research_health.py
 python3 -m unittest test_ib_research_geo test_institution_intelligence
 ```
 
-定时任务见 `ib_research_cron_runner.py`（带锁、日志、异常告警）。
+定时任务见 `ib_research_cron_runner.py`（带锁、日志、异常告警）。每次采集成功且质量检查通过后，`publish_cloudflare.py` 会在后台导出并发布新的 Cloudflare 静态快照。
 
 ## 上线
 
-本仓库是代码源头；`~/.openclaw/workspace` 是运行环境（数据目录和 `.env` 留在那边，不被覆盖）。
+本仓库是代码源头；`~/.openclaw/workspace` 是采集运行环境（数据目录和 `.env` 留在那边，不被覆盖）。公网请求不再依赖本机 Flask/Tunnel 在线。
 
 ```bash
-bash deploy.sh    # 同步代码 → 语法校验 → 单测 → 重启 8081 → 冒烟
+bash deploy.sh    # 同步代码 → 校验/单测 → 本机预览冒烟 → 发布 Cloudflare
+python3 publish_cloudflare.py  # 仅重新导出并发布当前只读快照
 ```
 
-公网 `https://fresearch.cc.cd` 经 `com.xieshangchao.cloudflare-8081` 转到本机 `127.0.0.1:8081`。HTML 有 `max-age=60` / `s-maxage=300`，刚部署后浏览器可能要硬刷新。
+公网 `https://fresearch.cc.cd/*` 由 Worker route 直接命中静态资产；`127.0.0.1:8081` 仅保留为本机预览和手动刷新入口。Cloudflare 部署是不可变版本，发布失败时线上继续提供上一版内容。
 
 ## 代码结构
 
@@ -96,6 +97,9 @@ bash deploy.sh    # 同步代码 → 语法校验 → 单测 → 重启 8081 →
 | `ib_research_cron_runner.py` | 定时抓取入口 |
 | `ib_research_health.py` | 数据新鲜度 / 质量检查 |
 | `ib_research_seo_monitor.py` | 公网收录巡检 |
+| `export_static_site.py` | 把 Flask 只读页面、JSON API 与图标导出为静态站点 |
+| `publish_cloudflare.py` | 带锁构建并通过 Wrangler 发布 Cloudflare 快照 |
+| `wrangler.jsonc` | Workers Static Assets、预览地址与生产 route 配置 |
 | `deploy.sh` | 同步到 workspace 并重启服务 |
 | `test_ib_research_geo.py` / `test_institution_intelligence.py` | 页面与机构分析单测 |
 

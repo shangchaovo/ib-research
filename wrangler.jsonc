@@ -1,0 +1,23 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "fresearch",
+  "account_id": "7cc8529bb0488ee3f2e232fb6d79a875",
+  "compatibility_date": "2026-09-01",
+  "workers_dev": true,
+  "preview_urls": true,
+  "routes": [
+    {
+      "pattern": "fresearch.cc.cd/*",
+      "zone_name": "fresearch.cc.cd"
+    }
+  ],
+  "assets": {
+    "directory": "./cloudflare_dist",
+    "html_handling": "force-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 0.1
+  }
+}

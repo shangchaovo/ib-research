@@ -24,11 +24,16 @@ ORIGIN = os.environ.get("IB_RESEARCH_PUBLIC_ORIGIN", "https://fresearch.cc.cd").
 PROXY = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or "http://127.0.0.1:1082"
 GSC_TOKEN = "s8mvn7tXPvT_q4BHyD2tZAXPFuj3xdUSksDjR6BCj1g"
 STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "seo_monitor_state.json")
+FAILURES_BEFORE_ALERT = max(1, int(os.environ.get("IB_RESEARCH_MONITOR_FAILURES_BEFORE_ALERT", "2")))
+REMINDER_SECONDS = max(3600, int(os.environ.get("IB_RESEARCH_MONITOR_REMINDER_SECONDS", str(24 * 3600))))
 
 # 每项: (key, 路径, 校验函数)  —— 校验返回 True 表示通过
 CHECKS = [
     ("home", "/", lambda s, h: GSC_TOKEN in s),
-    ("home_indexable", "/", lambda s, h: "index" in h.get("X-Robots-Tag", "")),
+    ("home_indexable", "/", lambda s, h: (
+        "index" in h.get("X-Robots-Tag", "").lower()
+        and "noindex" not in h.get("X-Robots-Tag", "").lower()
+    )),
     ("home_ogimage", "/", lambda s, h: "og:image" in s),
     ("robots", "/robots.txt", lambda s, h: "sitemap" in s.lower()),
     ("sitemap", "/sitemap.xml", lambda s, h: "<urlset" in s and "/stocks/" in s),
@@ -41,16 +46,22 @@ CHECKS = [
 
 
 def _fetch(path: str):
-    """先直连, 失败再走代理; 返回 (status, text, headers) 或 None。"""
+    """先直连, 失败再走代理; 返回响应及可诊断的失败摘要。"""
     url = urljoin(ORIGIN + "/", path.lstrip("/"))
-    for proxies in (None, {"http": PROXY, "https": PROXY}):
+    failures = []
+    attempts = (
+        ("direct", None),
+        ("proxy", {"http": PROXY, "https": PROXY}),
+    )
+    for label, proxies in attempts:
         try:
             r = requests.get(url, timeout=20, proxies=proxies, verify=False,
                              headers={"Cache-Control": "no-cache", "User-Agent": "fresearch-seo-monitor/1.0"})
-            return r.status_code, r.text, r.headers
-        except Exception:
-            continue
-    return None
+            text = r.content.decode("utf-8", errors="replace")
+            return (r.status_code, text, r.headers), f"{label}: http {r.status_code}"
+        except Exception as exc:
+            failures.append(f"{label}: {type(exc).__name__}")
+    return None, "; ".join(failures)
 
 
 def _load_state() -> dict:
@@ -79,12 +90,62 @@ def _notify_qq(message: str) -> None:
         print(f"[seo_monitor] QQ 告警发送失败: {e!r}", file=sys.stderr)
 
 
+def _notification_for_state(
+    failing: list[str],
+    results: dict[str, tuple[bool, str]],
+    state: dict,
+    now: float,
+) -> tuple[str | None, dict]:
+    """将多探针结果折叠为单个事故状态，避免失败集合抖动造成重复告警。"""
+    previous_status = state.get("status")
+    if previous_status not in {"healthy", "failing"}:
+        previous_status = "failing" if state.get("failing") else "healthy"
+    consecutive = int(state.get("consecutive_failures", 0) or 0)
+    incident_alerted = bool(state.get("incident_alerted", False))
+
+    message = None
+    if failing:
+        consecutive = consecutive + 1 if previous_status == "failing" else 1
+        if previous_status != "failing":
+            state["first_failure_ts"] = now
+
+        last_alert = float(state.get("last_alert_ts", 0) or 0)
+        initial_alert = not incident_alerted and consecutive >= FAILURES_BEFORE_ALERT
+        reminder = incident_alerted and now - last_alert >= REMINDER_SECONDS
+        if initial_alert or reminder:
+            message = (
+                "⚠️ FResearch 线上监控异常\n"
+                + "\n".join(f"· {key}: {results[key][1]}" for key in failing)
+                + f"\n已连续失败 {consecutive} 次\n{ORIGIN}"
+            )
+            state["last_alert_ts"] = now
+            incident_alerted = True
+
+        state["status"] = "failing"
+        state["consecutive_failures"] = consecutive
+        state["incident_alerted"] = incident_alerted
+    else:
+        if previous_status == "failing" and incident_alerted:
+            message = f"✅ FResearch 线上恢复正常 ({ORIGIN})"
+        state["status"] = "healthy"
+        state["consecutive_failures"] = 0
+        state["incident_alerted"] = False
+        state.pop("first_failure_ts", None)
+
+    state["failing"] = failing
+    state["last_check_ts"] = now
+    return message, state
+
+
 def main() -> int:
     results = {}
+    fetched = {}
     for key, path, check in CHECKS:
-        got = _fetch(path)
+        if path not in fetched:
+            fetched[path] = _fetch(path)
+        got, fetch_detail = fetched[path]
         if got is None:
-            results[key] = (False, "unreachable")
+            results[key] = (False, f"unreachable ({fetch_detail})")
             continue
         status, text, headers = got
         ok = status == 200
@@ -96,27 +157,20 @@ def main() -> int:
 
     failing = sorted(k for k, (ok, _) in results.items() if not ok)
     state = _load_state()
-    prev_failing = set(state.get("failing", []))
     now = time.time()
 
     for key, (ok, detail) in results.items():
         print(f"  {'✅' if ok else '❌'} {key:16s} {detail}")
 
+    message, state = _notification_for_state(failing, results, state, now)
+    if message:
+        _notify_qq(message)
+
     if failing:
-        should_alert = set(failing) != prev_failing or (now - state.get("last_alert_ts", 0)) > 6 * 3600
-        if should_alert:
-            _notify_qq("⚠️ FResearch 线上监控异常\n"
-                       + "\n".join(f"· {k}: {results[k][1]}" for k in failing)
-                       + f"\n{ORIGIN}")
-            state["last_alert_ts"] = now
         print(f"异常: {', '.join(failing)}")
     else:
-        if prev_failing:
-            _notify_qq(f"✅ FResearch 线上恢复正常 ({ORIGIN})")
         print("全部正常")
 
-    state["failing"] = failing
-    state["last_check_ts"] = now
     _save_state(state)
     return 0
 

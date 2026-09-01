@@ -5,3 +5,6 @@ __pycache__/
 data/
 *.log
 seo_monitor_state.json
+cloudflare_dist/
+.wrangler/
+node_modules/

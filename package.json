@@ -1,0 +1,12 @@
+{
+  "name": "fresearch-cloudflare",
+  "private": true,
+  "scripts": {
+    "build": "python3 export_static_site.py",
+    "deploy": "python3 publish_cloudflare.py",
+    "check": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "4.127.1"
+  }
+}
