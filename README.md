@@ -1,18 +1,10 @@
-# FResearch — 投行目标价、公开观点与市场验证
+# FResearch
 
-追踪 UBS、Citi、Morgan Stanley、JPMorgan 等机构对关注股票的**评级、目标价与公开研报观点**，并检验观点发布后 1、5、20 个交易日相对 SPY 的表现。
+看外资怎么给关注的股票定价。UBS、Citi、摩跟、大摩这些机构的评级和目标价会收进来；发完 1 天、5 天、20 天相对 SPY 走没走，也会记一笔。
 
-**线上站点：[fresearch.cc.cd](https://fresearch.cc.cd/)**
+站点：[fresearch.cc.cd](https://fresearch.cc.cd/)
 
-Equity-research aggregator for **analyst ratings** and **target prices**, with LLM summaries and post-publication market validation versus SPY. Coverage focuses on AI compute, HBM/storage, semiconductor equipment and cloud.
-
-## 核心用处
-
-- 不想逐家翻新闻，也能看到「这家外资现在怎么看 NVDA / TSM / ASML」
-- 目标价必须有公开交叉证据才会进卡片，LLM 抽出来的数字不会单独当事实
-- 观点发出去之后有没有被行情确认，用相对 SPY 的超额收益说话
-
-采集与摘要每 4 小时刷新，市场验证每日补齐。
+大概四小时抓一轮，行情验证每天补。目标价没有公开出处的，不会单独拿 LLM 抽出来的数字充数。关注池主要是算力、HBM、设备这几条线上的股票。
 
 > `git push` 只更新 GitHub。公网站点由本机 `8081` 经 Cloudflare Tunnel 对外；代码要上线请跑 `bash deploy.sh`。
 
