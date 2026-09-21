@@ -949,6 +949,71 @@ def _select_rating_page(
     }
 
 
+def _stock_attention_rows(changes: list[dict], *, tracked_only: bool = True) -> list[dict]:
+    """按个股汇总评级账本中的公开动作次数与独立机构数。
+
+    Rating_Changes 在进入这里前已经按事件键去重，因此一条账本事件计一次提及。
+    机构数单独展示，避免把同一家机构的连续调整误读成更广泛的市场共识。
+    """
+    stats: dict[str, dict] = {}
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        detail = change.get("detail", {}) or {}
+        symbol = str(detail.get("Symbol") or "").strip().upper()
+        if not symbol or (tracked_only and symbol not in HOT_SYMBOLS):
+            continue
+        row = stats.setdefault(symbol, {"symbol": symbol, "mentions": 0, "banks": set()})
+        row["mentions"] += 1
+        bank = str(detail.get("Bank") or "").strip()
+        if bank and bank != "—":
+            row["banks"].add(bank)
+
+    rows = [
+        {
+            "symbol": row["symbol"],
+            "mentions": row["mentions"],
+            "institutions": len(row["banks"]),
+        }
+        for row in stats.values()
+    ]
+    rows.sort(key=lambda row: (-row["mentions"], -row["institutions"], row["symbol"]))
+    return rows
+
+
+def _stock_attention_html(rows: list[dict], *, limit: int = 8) -> str:
+    """渲染个股关注度榜；前端切换时间窗时会用同一结构重绘。"""
+    visible = rows[:limit]
+    if not visible:
+        return '<li class="attention-empty">当前范围内暂无可统计的公开动作</li>'
+
+    peak = max(int(row.get("mentions") or 0) for row in visible) or 1
+    cards = []
+    for index, row in enumerate(visible, start=1):
+        symbol = str(row.get("symbol") or "—")
+        mentions = int(row.get("mentions") or 0)
+        institutions = int(row.get("institutions") or 0)
+        width = max(8, round(mentions / peak * 100))
+        href = _stock_href(symbol)
+        symbol_html = (
+            f'<a class="attention-symbol" href="{_safe_attr(href)}">{_safe_text(symbol)}</a>'
+            if href
+            else f'<span class="attention-symbol">{_safe_text(symbol)}</span>'
+        )
+        cards.append(
+            '<li class="attention-item">'
+            f'<div class="attention-rank">{index:02d}</div>'
+            '<div class="attention-item-main">'
+            f'<div class="attention-item-top">{symbol_html}'
+            f'<span class="attention-count"><strong>{mentions}</strong> 次</span></div>'
+            '<div class="attention-track" aria-hidden="true">'
+            f'<span style="width:{width}%"></span></div>'
+            f'<div class="attention-institutions">{institutions} 家机构</div>'
+            '</div></li>'
+        )
+    return "".join(cards)
+
+
 def _generate_html(report: dict, can_refresh: bool = False) -> str:
     """生成HTML报告页面 (适配专业量化分析结构)"""
     meta = report.get("meta", {})
@@ -1328,15 +1393,23 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     )
     default_pagination_hidden = " hidden" if default_pages <= 1 else ""
 
+    # 个股关注度与表格使用同一份去重账本；首屏默认口径同样是近 30 天关注池。
+    stock_attention_rows = _stock_attention_rows(changes, tracked_only=True)
+    stock_attention_html = _stock_attention_html(stock_attention_rows)
+    stock_attention_symbol_count = len(stock_attention_rows)
+    stock_attention_event_count = sum(row["mentions"] for row in stock_attention_rows)
+
     rating_ledger_json = json.dumps(
         [
             {
                 "s": str((change.get("detail", {}) or {}).get("Symbol") or "").upper(),
+                "b": str((change.get("detail", {}) or {}).get("Bank") or ""),
                 "d": (
                     _rating_date((change.get("detail", {}) or {}).get("Time"))
                     or _rating_date((change.get("detail", {}) or {}).get("_First_Seen"))
                 ),
                 "t": 1 if str((change.get("detail", {}) or {}).get("Symbol") or "").strip().upper() in HOT_SYMBOLS else 0,
+                "u": _stock_href(str((change.get("detail", {}) or {}).get("Symbol") or "")),
                 "h": html_row,
             }
             for change, html_row in zip(changes, all_row_html)
@@ -2112,6 +2185,215 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 font: 11px "JetBrains Mono", monospace;
                 color: var(--text-secondary);
             }}
+
+            /* 个股提及热度：与评级账本的范围、时间筛选保持同一口径。 */
+            .stock-attention {{
+                position: relative;
+                overflow: hidden;
+                margin: 0 0 18px;
+                padding: 22px 24px 20px;
+                border: 1px solid var(--border);
+                border-radius: var(--radius-lg);
+                background:
+                    radial-gradient(circle at 94% 0%, var(--gold-dim), transparent 34%),
+                    var(--surface);
+            }}
+            .attention-head {{
+                display: flex;
+                align-items: flex-end;
+                justify-content: space-between;
+                gap: 22px;
+                margin-bottom: 18px;
+            }}
+            .attention-kicker {{
+                display: block;
+                margin-bottom: 5px;
+                color: var(--gold);
+                font: 600 10px var(--font-mono);
+                letter-spacing: .14em;
+                text-transform: uppercase;
+            }}
+            .attention-title {{
+                margin: 0 0 4px;
+                color: var(--text);
+                font-family: var(--font-serif);
+                font-size: 21px;
+                font-weight: 500;
+                line-height: 1.3;
+            }}
+            .attention-description {{
+                margin: 0;
+                max-width: 72ch;
+                color: var(--text-secondary);
+                font-size: 12.5px;
+                line-height: 1.65;
+            }}
+            .attention-summary {{
+                display: flex;
+                flex: 0 0 auto;
+                gap: 8px;
+                color: var(--text-tertiary);
+                font: 11px var(--font-mono);
+                white-space: nowrap;
+            }}
+            .attention-summary span {{
+                padding: 6px 9px;
+                border: 1px solid var(--border);
+                border-radius: 999px;
+                background: var(--bg-elevated);
+            }}
+            .attention-summary strong {{ color: var(--text); font-weight: 650; }}
+            .attention-list {{
+                display: grid;
+                grid-template-columns: repeat(4, minmax(0, 1fr));
+                gap: 10px;
+                margin: 0;
+                padding: 0;
+                list-style: none;
+            }}
+            .attention-item {{
+                display: grid;
+                grid-template-columns: 25px minmax(0, 1fr);
+                gap: 10px;
+                min-width: 0;
+                padding: 13px 14px 12px;
+                border: 1px solid var(--border);
+                border-radius: var(--radius-md);
+                background: color-mix(in srgb, var(--surface-2) 58%, transparent);
+                transition: border-color .2s var(--ease-out), transform .2s var(--ease-out);
+            }}
+            .attention-item:hover {{
+                transform: translateY(-1px);
+                border-color: var(--border-strong);
+            }}
+            .attention-rank {{
+                padding-top: 2px;
+                color: var(--text-tertiary);
+                font: 10px var(--font-mono);
+                letter-spacing: .06em;
+            }}
+            .attention-item-main {{ min-width: 0; }}
+            .attention-item-top {{
+                display: flex;
+                align-items: baseline;
+                justify-content: space-between;
+                gap: 8px;
+            }}
+            .attention-symbol {{
+                overflow: hidden;
+                color: var(--text);
+                font: 650 14px var(--font-mono);
+                letter-spacing: .02em;
+                text-decoration: none;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+            }}
+            a.attention-symbol:hover {{ color: var(--gold); }}
+            .attention-count {{
+                flex: 0 0 auto;
+                color: var(--text-tertiary);
+                font: 10px var(--font-mono);
+            }}
+            .attention-count strong {{
+                color: var(--gold);
+                font-size: 17px;
+                font-weight: 650;
+            }}
+            .attention-track {{
+                height: 3px;
+                margin: 8px 0 6px;
+                overflow: hidden;
+                border-radius: 999px;
+                background: var(--surface-3);
+            }}
+            .attention-track span {{
+                display: block;
+                height: 100%;
+                border-radius: inherit;
+                background: linear-gradient(90deg, var(--gold), var(--gold-bright));
+            }}
+            .attention-institutions {{
+                color: var(--text-tertiary);
+                font: 10px var(--font-mono);
+            }}
+            .attention-empty {{
+                grid-column: 1 / -1;
+                padding: 18px;
+                border: 1px dashed var(--border-strong);
+                border-radius: var(--radius-md);
+                color: var(--text-tertiary);
+                font-size: 12px;
+                text-align: center;
+            }}
+
+            /* 表格顶部的同步滚动条；仅在表格确实横向溢出时显示。 */
+            .rating-scroll-guide {{
+                margin: 0 0 8px;
+                overflow: hidden;
+                border: 1px solid var(--border);
+                border-radius: 10px;
+                background: var(--surface);
+            }}
+            .rating-scroll-guide[hidden] {{ display: none; }}
+            .rating-scroll-label {{
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 12px;
+                padding: 7px 11px 1px;
+                color: var(--text-tertiary);
+                font: 10px var(--font-mono);
+                letter-spacing: .03em;
+            }}
+            .rating-scroll-label span:last-child {{ color: var(--gold); }}
+            .rating-scroll-top {{
+                --rating-scroll-thumb: 72px;
+                display: block;
+                width: calc(100% - 20px);
+                height: 18px;
+                margin: 0 10px 5px;
+                padding: 0;
+                appearance: none;
+                -webkit-appearance: none;
+                border: 0;
+                outline: 0;
+                background: transparent;
+                cursor: ew-resize;
+            }}
+            .rating-scroll-top:focus-visible {{
+                outline: 2px solid var(--gold);
+                outline-offset: 1px;
+                border-radius: 999px;
+            }}
+            .rating-scroll-top::-webkit-slider-runnable-track {{
+                height: 6px;
+                border-radius: 999px;
+                background: var(--surface-3);
+            }}
+            .rating-scroll-top::-webkit-slider-thumb {{
+                width: var(--rating-scroll-thumb);
+                height: 12px;
+                margin-top: -3px;
+                appearance: none;
+                -webkit-appearance: none;
+                border: 2px solid var(--surface-3);
+                border-radius: 999px;
+                background: var(--gold);
+                box-shadow: 0 1px 6px var(--gold-glow);
+            }}
+            .rating-scroll-top::-moz-range-track {{
+                height: 6px;
+                border-radius: 999px;
+                background: var(--surface-3);
+            }}
+            .rating-scroll-top::-moz-range-thumb {{
+                width: var(--rating-scroll-thumb);
+                height: 12px;
+                border: 2px solid var(--surface-3);
+                border-radius: 999px;
+                background: var(--gold);
+                box-shadow: 0 1px 6px var(--gold-glow);
+            }}
             
             /* Table：基础表格样式来自 design_system，这里只补首页特有的列宽与密度 */
             .rating-table {{ min-width: 880px; }}
@@ -2587,6 +2869,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 .refresh-controls {{ justify-content: flex-start; width: 100%; }}
                 .update-time {{ text-align: left; flex-basis: 100%; }}
                 .section-head {{ flex-direction: column; align-items: flex-start; gap: 6px; }}
+                .attention-list {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
                 .panel {{ padding: 24px; }}
             }}
             @media (max-width: 640px) {{
@@ -2596,9 +2879,16 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 .rating-toolbar {{ flex-direction: column; align-items: flex-start; }}
                 .rating-toolbar-cluster {{ align-items: flex-start; }}
                 .rating-pagination-top {{ width: 100%; justify-content: flex-start; }}
+                .stock-attention {{ padding: 19px 17px 17px; }}
+                .attention-head {{ align-items: flex-start; flex-direction: column; gap: 12px; }}
+                .attention-summary {{ flex-wrap: wrap; white-space: normal; }}
+                .rating-scroll-label {{ align-items: flex-start; flex-direction: column; gap: 2px; }}
                 .bmc-panel, .contact-panel {{ flex-direction: column; align-items: flex-start; }}
                 table {{ font-size: 13px; }}
                 tbody td {{ padding: 14px 12px; }}
+            }}
+            @media (max-width: 420px) {{
+                .attention-list {{ grid-template-columns: 1fr; }}
             }}
             .site-nav {{
                 display: flex;
@@ -2761,7 +3051,32 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                     </nav>
                 </div>
             </div>
-            <div class="table-wrap reveal">
+            <aside class="stock-attention" id="stockAttention" aria-labelledby="stockAttentionTitle">
+                <div class="attention-head">
+                    <div>
+                        <span class="attention-kicker">Institutional attention</span>
+                        <h3 class="attention-title" id="stockAttentionTitle">近期个股提及热度</h3>
+                        <p class="attention-description">
+                            按当前范围内已去重的评级与目标价公开动作计数，每条事件计 1 次；机构数用于区分单家连续调整与多机构共同关注。显示前 8 名，并随上方筛选联动。
+                        </p>
+                    </div>
+                    <div class="attention-summary" aria-live="polite">
+                        <span><strong id="attentionEventCount">{stock_attention_event_count}</strong> 次公开动作</span>
+                        <span><strong id="attentionSymbolCount">{stock_attention_symbol_count}</strong> 只股票</span>
+                    </div>
+                </div>
+                <ol class="attention-list" id="stockAttentionList">
+                    {stock_attention_html}
+                </ol>
+            </aside>
+            <div class="rating-scroll-guide" id="ratingScrollGuide" hidden>
+                <div class="rating-scroll-label">
+                    <span>向右拖动即可查看完整日期，无需滚到表格底部</span>
+                    <span aria-hidden="true">日期在最右侧 →</span>
+                </div>
+                <input class="rating-scroll-top" id="ratingScrollTop" type="range" min="0" max="0" value="0" step="1" aria-label="向右拖动查看完整日期" aria-controls="ratingTableWrap">
+            </div>
+            <div class="table-wrap rating-table-wrap reveal" id="ratingTableWrap">
                 <table class="rating-table">
                     <thead>
                         <tr>
@@ -2965,6 +3280,111 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             if (dates.length) return dates.reduce((a, b) => (a > b ? a : b));
             return new Date().toISOString().slice(0, 10);
         }}
+        function renderStockAttention(scoped) {{
+            const list = document.getElementById('stockAttentionList');
+            if (!list) return;
+            const grouped = new Map();
+            scoped.forEach(item => {{
+                const symbol = String(item.s || '').trim().toUpperCase();
+                if (!symbol) return;
+                if (!grouped.has(symbol)) {{
+                    grouped.set(symbol, {{ symbol, mentions: 0, banks: new Set(), url: item.u || '' }});
+                }}
+                const row = grouped.get(symbol);
+                row.mentions += 1;
+                if (item.b) row.banks.add(String(item.b));
+                if (!row.url && item.u) row.url = item.u;
+            }});
+            const ranked = Array.from(grouped.values()).sort((a, b) =>
+                b.mentions - a.mentions || b.banks.size - a.banks.size || a.symbol.localeCompare(b.symbol, 'en')
+            );
+            const eventCount = document.getElementById('attentionEventCount');
+            const symbolCount = document.getElementById('attentionSymbolCount');
+            if (eventCount) eventCount.textContent = String(ranked.reduce((sum, row) => sum + row.mentions, 0));
+            if (symbolCount) symbolCount.textContent = String(ranked.length);
+
+            list.replaceChildren();
+            if (!ranked.length) {{
+                const empty = document.createElement('li');
+                empty.className = 'attention-empty';
+                empty.textContent = '当前范围内暂无可统计的公开动作';
+                list.appendChild(empty);
+                return;
+            }}
+            const visible = ranked.slice(0, 8);
+            const peak = visible[0].mentions || 1;
+            visible.forEach((row, index) => {{
+                const item = document.createElement('li');
+                item.className = 'attention-item';
+
+                const rank = document.createElement('div');
+                rank.className = 'attention-rank';
+                rank.textContent = String(index + 1).padStart(2, '0');
+
+                const main = document.createElement('div');
+                main.className = 'attention-item-main';
+                const top = document.createElement('div');
+                top.className = 'attention-item-top';
+                const symbol = document.createElement(row.url ? 'a' : 'span');
+                symbol.className = 'attention-symbol';
+                symbol.textContent = row.symbol;
+                if (row.url) symbol.setAttribute('href', row.url);
+                const count = document.createElement('span');
+                count.className = 'attention-count';
+                const countStrong = document.createElement('strong');
+                countStrong.textContent = String(row.mentions);
+                count.append(countStrong, document.createTextNode(' 次'));
+                top.append(symbol, count);
+
+                const track = document.createElement('div');
+                track.className = 'attention-track';
+                track.setAttribute('aria-hidden', 'true');
+                const fill = document.createElement('span');
+                fill.style.width = `${{Math.max(8, Math.round(row.mentions / peak * 100))}}%`;
+                track.appendChild(fill);
+
+                const institutions = document.createElement('div');
+                institutions.className = 'attention-institutions';
+                institutions.textContent = `${{row.banks.size}} 家机构`;
+                main.append(top, track, institutions);
+                item.append(rank, main);
+                list.appendChild(item);
+            }});
+        }}
+        let updateRatingScrollMirror = () => {{}};
+        function setupRatingScrollMirror() {{
+            const guide = document.getElementById('ratingScrollGuide');
+            const slider = document.getElementById('ratingScrollTop');
+            const tableWrap = document.getElementById('ratingTableWrap');
+            if (!guide || !slider || !tableWrap) return;
+            slider.addEventListener('input', () => {{
+                tableWrap.scrollLeft = Number(slider.value) || 0;
+            }});
+            tableWrap.addEventListener('scroll', () => {{
+                slider.value = String(Math.round(tableWrap.scrollLeft));
+            }}, {{ passive: true }});
+            updateRatingScrollMirror = () => {{
+                const travel = Math.max(0, tableWrap.scrollWidth - tableWrap.clientWidth);
+                guide.hidden = travel <= 1;
+                if (guide.hidden) return;
+                slider.max = String(Math.ceil(travel));
+                slider.value = String(Math.round(tableWrap.scrollLeft));
+                requestAnimationFrame(() => {{
+                    const visibleRatio = Math.min(1, tableWrap.clientWidth / tableWrap.scrollWidth);
+                    const thumbWidth = Math.max(44, Math.round(slider.clientWidth * visibleRatio));
+                    slider.style.setProperty('--rating-scroll-thumb', `${{thumbWidth}}px`);
+                }});
+            }};
+            if ('ResizeObserver' in window) {{
+                const observer = new ResizeObserver(updateRatingScrollMirror);
+                observer.observe(tableWrap);
+                const table = tableWrap.querySelector('table');
+                if (table) observer.observe(table);
+            }} else {{
+                window.addEventListener('resize', updateRatingScrollMirror, {{ passive: true }});
+            }}
+            updateRatingScrollMirror();
+        }}
         function applyRatingView() {{
             const tbody = document.getElementById('ratingTableBody');
             if (!tbody) return;
@@ -2979,6 +3399,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 const cutoff = anchor.toISOString().slice(0, 10);
                 scoped = scoped.filter(item => item.d && item.d >= cutoff);
             }}
+            renderStockAttention(scoped);
             if (ratingView.sort === 'symbol') {{
                 scoped.sort((a, b) => (a.s || '').localeCompare(b.s || '', 'en')
                     || (b.d || '').localeCompare(a.d || ''));
@@ -3027,6 +3448,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 button.disabled = ratingView.page >= totalPages;
             }});
             scheduleVisibleLogoRefresh();
+            updateRatingScrollMirror();
         }}
         function setRatingUniverse(universe) {{
             ratingView.universe = universe === 'tracked' ? 'tracked' : 'all';
@@ -3159,6 +3581,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         }})();
         // 首屏的行、计数与分页状态都由服务端给出，加载时不调 applyRatingView，
         // 于是 1MB 级的账本 JSON 完全不进首屏关键路径。
+        setupRatingScrollMirror();
         scheduleVisibleLogoRefresh();
         updateRelativeTime();
         setInterval(updateRelativeTime, 60000);

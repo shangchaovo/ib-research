@@ -274,6 +274,7 @@ class GeoPagesTest(unittest.TestCase):
         self.assertEqual(sum(item["t"] for item in ledger), 65)
         self.assertTrue(all(item["h"].startswith("<tr class=\"rating-row\"") for item in ledger))
         self.assertTrue(any(item["s"] == "ZZZZ" and item["t"] == 0 for item in ledger))
+        self.assertTrue(all("b" in item and "u" in item for item in ledger))
 
         # 首屏默认关注池，非关注池事件不出现在服务端渲染的那一页里。
         self.assertNotIn('data-symbol="ZZZZ"', body)
@@ -285,6 +286,29 @@ class GeoPagesTest(unittest.TestCase):
         self.assertIn("其中关注池 65 条", html)
         self.assertIn('id="ratingPagination"', html)
         self.assertIn("pageSize: 30", html)
+
+    def test_homepage_ranks_recent_stock_mentions_and_mirrors_horizontal_scroll(self):
+        report = _empty_report()
+        template = report["summary"]["Rating_Changes"][0]
+        report["summary"]["Rating_Changes"] = [
+            {**template, "Symbol": "CRM", "Bank": "Morgan Stanley", "Time": "2026-08-17"},
+            {**template, "Symbol": "CRM", "Bank": "Goldman Sachs", "Time": "2026-08-16"},
+            {**template, "Symbol": "CRM", "Bank": "Morgan Stanley", "Time": "2026-08-15"},
+            {**template, "Symbol": "NVDA", "Bank": "JPMorgan", "Time": "2026-08-14"},
+        ]
+        html = _generate_html(report)
+
+        attention = html.split('id="stockAttention"', 1)[1].split("</aside>", 1)[0]
+        self.assertLess(attention.index(">CRM</a>"), attention.index(">NVDA</a>"))
+        self.assertIn('<strong id="attentionEventCount">4</strong>', attention)
+        self.assertIn('<strong id="attentionSymbolCount">2</strong>', attention)
+        self.assertIn('<strong>3</strong> 次', attention)
+        self.assertIn("2 家机构", attention)
+        self.assertIn('id="ratingScrollGuide"', html)
+        self.assertIn('id="ratingScrollTop"', html)
+        self.assertIn('id="ratingTableWrap"', html)
+        self.assertIn("renderStockAttention(scoped)", html)
+        self.assertIn("setupRatingScrollMirror()", html)
 
     def test_rating_rows_drop_the_pending_source_column_noise(self):
         report = _empty_report()
