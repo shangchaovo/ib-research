@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """SEO/GEO 公开页与爬虫入口的回归测试。"""
+import base64
 import json
 import unittest
 from unittest.mock import patch
@@ -14,7 +15,7 @@ from ib_research_geo import (
     compare_slug,
     sitemap_xml,
 )
-from ib_research_server import _generate_html, app
+from ib_research_server import _generate_html, _logo_svg_document, app
 
 
 def _empty_report():
@@ -309,6 +310,26 @@ class GeoPagesTest(unittest.TestCase):
         self.assertIn('id="ratingTableWrap"', html)
         self.assertIn("renderStockAttention(scoped)", html)
         self.assertIn("setupRatingScrollMirror()", html)
+        self.assertIn('class="symbol-cell attention-symbol-cell"', attention)
+        self.assertIn("/assets/logos/CRM.svg?v=3", attention)
+        self.assertIn("/assets/logos/NVDA.svg?v=3", attention)
+        coverage = html.split(">关注池<", 1)[1][:4000]
+        self.assertIn('class="asset-chip"', coverage)
+        self.assertIn('class="row-logo"', coverage)
+
+    def test_raster_logo_is_served_as_real_svg(self):
+        png = base64.b64decode(
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
+        )
+        wrapped = _logo_svg_document(png, "image/png")
+        self.assertTrue(wrapped.startswith(b"<svg"))
+        self.assertIn(b"data:image/png;base64,", wrapped)
+        with patch("ib_research_server._read_cached_logo", return_value=(png, "image/png")):
+            response = app.test_client().get("/assets/logos/MRVL.svg")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "image/svg+xml")
+        self.assertTrue(response.data.startswith(b"<svg"))
+        self.assertEqual(response.headers.get("X-Logo-Source"), "cache")
 
     def test_rating_rows_drop_the_pending_source_column_noise(self):
         report = _empty_report()

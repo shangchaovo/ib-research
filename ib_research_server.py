@@ -33,7 +33,7 @@ from flask import Flask, jsonify, Response, request
 
 # 将workspace加入路径
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from design_system import PAGE_CSS
+from design_system import MOTION_SCRIPT, PAGE_CSS
 from ib_research_fetcher import run_fetch, get_latest_report, CACHE_DIR, FINNHUB_TOKEN, HOT_SYMBOLS
 from institution_intelligence import build_institution_intelligence
 from ib_research_geo import (
@@ -592,6 +592,25 @@ def _queue_logo_fetch(normalized: str) -> None:
     _logo_executor.submit(_background_logo_fetch, normalized)
 
 
+def _logo_svg_document(body: bytes, mimetype: str) -> bytes:
+    """把缓存里的位图包成真正的 SVG。
+
+    公开站把 /assets/logos/*.svg 一律标成 image/svg+xml。PNG/JPEG 若仍以 .svg
+    下发，浏览器会因 nosniff 拒载，页面就只剩首字母占位。
+    """
+    if mimetype == "image/svg+xml":
+        return body
+    payload = base64.b64encode(body).decode("ascii")
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" '
+        'viewBox="0 0 64 64" role="img">'
+        f'<image width="64" height="64" preserveAspectRatio="xMidYMid meet" '
+        f'href="data:{mimetype};base64,{payload}" '
+        f'xlink:href="data:{mimetype};base64,{payload}"/>'
+        "</svg>"
+    ).encode("utf-8")
+
+
 def _get_logo_svg(symbol: str) -> tuple[bytes, str, str]:
     """同源即时返回：缓存命中用真实 logo，否则先用稳定占位图并后台预取。"""
     normalized = _normalize_logo_symbol(symbol)
@@ -600,7 +619,7 @@ def _get_logo_svg(symbol: str) -> tuple[bytes, str, str]:
     cached = _read_cached_logo(normalized)
     if cached is not None:
         body, mimetype = cached
-        return body, mimetype, "cache"
+        return _logo_svg_document(body, mimetype), "image/svg+xml", "cache"
     # 白名单闸口：报告里没出现过的 symbol 绝不回源（防公网刷接口耗 Finnhub 配额）
     if normalized in _allowed_logo_symbols():
         _queue_logo_fetch(normalized)
@@ -649,6 +668,7 @@ def logo_asset(symbol: str):
         return Response("too many requests", status=429, mimetype="text/plain")
     body, mimetype, source = _get_logo_svg(symbol)
     response = Response(body, mimetype=mimetype)
+    response.headers["X-Logo-Source"] = source
     response.headers["Cache-Control"] = (
         "public, max-age=86400, s-maxage=604800, stale-while-revalidate=2592000"
         if source != "fallback"
@@ -733,7 +753,7 @@ def _logo_url(symbol: str) -> str:
     normalized = _normalize_logo_symbol(symbol)
     if not normalized or symbol == "—":
         return ""
-    return f'/assets/logos/{quote(normalized, safe="-")}.svg?v=2'
+    return f'/assets/logos/{quote(normalized, safe="-")}.svg?v=3'
 
 
 def _logo_html(symbol: str, size: str = "row") -> str:
@@ -761,6 +781,19 @@ def _logo_html(symbol: str, size: str = "row") -> str:
                 <img class="asset-logo" src="{safe_url}" alt="{safe_symbol}" loading="lazy"{pending_attr} onerror="this.style.display='none'; this.nextElementSibling.style.display='flex';">
                 <div class="asset-logo-fallback">{safe_initial}</div>
             </div>'''
+
+
+def _symbol_cell(symbol: str, *, link_class: str = "symbol", extra_class: str = "") -> str:
+    """logo 与代码始终成对出现，评级表、热度榜、关注池和反应表共用这一套。"""
+    classes = "symbol-cell" + (f" {extra_class}" if extra_class else "")
+    label = _safe_text(symbol)
+    href = _stock_href(symbol)
+    name = (
+        f'<a class="{link_class}" href="{_safe_attr(href)}">{label}</a>'
+        if href
+        else f'<span class="{link_class}">{label}</span>'
+    )
+    return f'<span class="{classes}">{_logo_html(symbol)}{name}</span>'
 
 
 def _build_rating_ledger(report: dict) -> list[dict]:
@@ -858,12 +891,6 @@ def _rating_row_html(change: dict) -> str:
     else:
         rating_cell = '<span class="tag tag-empty" title="来源未公布评级，并非抓取失败">—</span>'
 
-    symbol_href = _stock_href(symbol)
-    symbol_html = (
-        f'<a class="symbol" href="{_safe_attr(symbol_href)}">{_safe_text(symbol)}</a>'
-        if symbol_href
-        else f'<span class="symbol">{_safe_text(symbol)}</span>'
-    )
     pt_html = (
         _safe_text(price_target)
         if price_target != "—"
@@ -876,7 +903,7 @@ def _rating_row_html(change: dict) -> str:
         f' data-bank="{escape(bank, quote=True)}"'
         f' data-tracked="{"1" if is_tracked else "0"}">'
         f'<td class="cell-dot">{_action_dot(action)}</td>'
-        f'<td><span class="symbol-cell">{_logo_html(symbol, size="row")}{symbol_html}</span></td>'
+        f'<td>{_symbol_cell(symbol)}</td>'
         f'<td class="cell-bank">{_safe_text(bank)}</td>'
         f'<td>{_safe_text(_action_display(action))}</td>'
         f'<td class="cell-rating">{rating_cell}</td>'
@@ -994,17 +1021,12 @@ def _stock_attention_html(rows: list[dict], *, limit: int = 8) -> str:
         mentions = int(row.get("mentions") or 0)
         institutions = int(row.get("institutions") or 0)
         width = max(8, round(mentions / peak * 100))
-        href = _stock_href(symbol)
-        symbol_html = (
-            f'<a class="attention-symbol" href="{_safe_attr(href)}">{_safe_text(symbol)}</a>'
-            if href
-            else f'<span class="attention-symbol">{_safe_text(symbol)}</span>'
-        )
         cards.append(
-            '<li class="attention-item">'
+            f'<li class="attention-item" style="--stagger-i:{index - 1}">'
             f'<div class="attention-rank">{index:02d}</div>'
             '<div class="attention-item-main">'
-            f'<div class="attention-item-top">{symbol_html}'
+            f'<div class="attention-item-top">'
+            f'{_symbol_cell(symbol, link_class="attention-symbol", extra_class="attention-symbol-cell")}'
             f'<span class="attention-count"><strong>{mentions}</strong> 次</span></div>'
             '<div class="attention-track" aria-hidden="true">'
             f'<span style="width:{width}%"></span></div>'
@@ -1258,13 +1280,12 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
 
         return f"""
         <div class="asset-card">
-            <div class="asset-card-top">
-                {_logo_html(asset, size='asset')}
-                {source_badge}
-            </div>
             <div class="asset-header">
-                {f'<a class="asset-ticker" href="{_safe_attr(_stock_href(asset))}">{_safe_text(asset)}</a>' if _stock_href(asset) else f'<span class="asset-ticker">{_safe_text(asset)}</span>'}
-                <span class="asset-target">{_safe_text(target)}</span>
+                {_symbol_cell(str(asset), link_class="asset-ticker")}
+                <div class="asset-header-meta">
+                    {source_badge}
+                    <span class="asset-target">{_safe_text(target)}</span>
+                </div>
             </div>
             {distribution_html}
             {change_html}
@@ -1344,7 +1365,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         chip_bits = []
         for a in assets_covered:
             href = _stock_href(a)
-            label = _safe_text(a)
+            label = f'{_logo_html(a)}{_safe_text(a)}'
             if href:
                 chip_bits.append(f'<a class="asset-chip" href="{_safe_attr(href)}">{label}</a>')
             else:
@@ -1547,7 +1568,8 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         alignment_rate = item.get("alignment_rate")
         alignment_text = _format_percent(alignment_rate, signed=False) if alignment_rate is not None else "待验证"
         symbols = "".join(
-            f'<a href="/stocks/{_safe_attr(str(symbol).lower())}/">{_safe_text(symbol)}</a>'
+            f'<a class="symbol-cell institution-symbol" href="/stocks/{_safe_attr(str(symbol).lower())}/">'
+            f'{_logo_html(symbol)}{_safe_text(symbol)}</a>'
             for symbol in (item.get("symbols") or [])[:5]
             if str(symbol).upper() in HOT_SYMBOLS
         )
@@ -1601,7 +1623,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         reaction_rows_html += f"""
         <tr>
             <td><a href="/institutions/{_safe_attr(event.get('institution_slug'))}/">{_safe_text(event.get('institution'))}</a></td>
-            <td><a class="symbol" href="/stocks/{_safe_attr(str(event.get('symbol') or '').lower())}/">{_safe_text(event.get('symbol'))}</a></td>
+            <td>{_symbol_cell(str(event.get('symbol') or ''))}</td>
             <td><span class="tone-badge {stance_class}">{_safe_text(event.get('stance_label'))}</span> {action_text}</td>
             <td class="mono">{_safe_text(event.get('price_target') or '—')}</td>
             <td class="mono">{_safe_text(horizon.upper() if horizon else '—')} {_safe_text(_format_percent(value) if value is not None else '—')}</td>
@@ -1622,7 +1644,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
     )
 
     stock_strip = "".join(
-        f'<a class="asset-chip" href="/stocks/{ticker.lower()}/">{_safe_text(ticker)}</a>'
+        f'<a class="asset-chip" href="/stocks/{ticker.lower()}/">{_logo_html(ticker)}{_safe_text(ticker)}</a>'
         for ticker in HOT_SYMBOLS[:12]
     )
     if len(HOT_SYMBOLS) > 12:
@@ -1669,9 +1691,9 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 border-bottom: 1px solid var(--border);
             }}
             .edition {{
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 11px;
-                letter-spacing: 0.22em;
+                letter-spacing: 0.14em;
                 color: var(--gold);
                 text-transform: uppercase;
                 font-weight: 500;
@@ -1707,7 +1729,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 font-weight: 500;
                 cursor: pointer;
                 transition: all 0.25s var(--ease-out);
-                font-family: "Bricolage Grotesk", sans-serif;
+                font-family: var(--font-sans);
                 box-shadow: var(--shadow-sm);
             }}
             .refresh-btn:hover {{
@@ -1726,7 +1748,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 font-weight: 500;
                 cursor: pointer;
                 padding: 8px 6px;
-                font-family: "Bricolage Grotesk", sans-serif;
+                font-family: var(--font-sans);
                 transition: color 0.2s ease;
             }}
             .refresh-secondary:hover {{ color: var(--gold); }}
@@ -1734,7 +1756,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 display: inline-flex;
                 align-items: center;
                 gap: 8px;
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 11px;
                 color: var(--text-secondary);
                 margin-bottom: 20px;
@@ -1751,7 +1773,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 animation: pulse 2s infinite;
             }}
             .update-time {{
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 12px;
                 color: var(--text-secondary);
                 min-width: 80px;
@@ -1805,6 +1827,39 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 font-weight: 400;
                 white-space: nowrap;
             }}
+            .hero-line {{
+                display: block;
+                padding: 0 0.12em 0.1em 0;
+                margin-bottom: -0.1em;
+                overflow: hidden;
+            }}
+            .hero-line > span {{ display: inline-block; }}
+            @media (prefers-reduced-motion: no-preference) {{
+                .hero-line > span {{ animation: lineRise 1.05s var(--ease-out) backwards; }}
+                .hero-line:nth-child(2) > span {{ animation-delay: 0.12s; }}
+                .hero-title em {{
+                    background: linear-gradient(100deg,
+                        var(--gold) 0%, var(--gold) 38%,
+                        color-mix(in srgb, var(--gold-bright) 55%, #fff4d6) 50%,
+                        var(--gold) 62%, var(--gold) 100%);
+                    background-size: 260% 100%;
+                    background-position: 0 0;
+                    -webkit-background-clip: text;
+                    background-clip: text;
+                    -webkit-text-fill-color: transparent;
+                    animation: goldSweep 2.2s var(--ease-in-out) 0.75s backwards;
+                }}
+                .hero-sub, .hero-boundary, .coverage {{ animation: fadeUp 0.9s var(--ease-out) backwards; }}
+                .hero-sub {{ animation-delay: 0.32s; }}
+                .hero-boundary {{ animation-delay: 0.42s; }}
+                .coverage {{ animation-delay: 0.52s; }}
+                .hero-metrics .meta-item > * {{ animation: fadeUp 0.8s var(--ease-out) backwards; }}
+                .hero-metrics .meta-item:nth-child(1) > * {{ animation-delay: 0.55s; }}
+                .hero-metrics .meta-item:nth-child(2) > * {{ animation-delay: 0.62s; }}
+                .hero-metrics .meta-item:nth-child(3) > * {{ animation-delay: 0.69s; }}
+                .hero-metrics .meta-item:nth-child(4) > * {{ animation-delay: 0.76s; }}
+                .hero-metrics .meta-item:nth-child(5) > * {{ animation-delay: 0.83s; }}
+            }}
             .hero-sub {{
                 font-size: 16.5px;
                 color: var(--text-secondary);
@@ -1851,12 +1906,15 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 background: var(--surface);
             }}
             .asset-chip {{
+                display: inline-flex;
+                align-items: center;
+                gap: 6px;
                 font-family: var(--font-mono);
                 font-size: 11.5px;
                 letter-spacing: 0.03em;
                 background: var(--surface-2);
                 color: var(--text-secondary);
-                padding: 4px 9px;
+                padding: 3px 9px 3px 3px;
                 border-radius: var(--radius-sm);
                 border: 1px solid var(--border);
                 transition: color 0.2s var(--ease-out), border-color 0.2s var(--ease-out);
@@ -1879,7 +1937,26 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 overflow: hidden;
                 margin-bottom: 72px;
             }}
-            .meta-item {{ background: var(--surface); padding: 18px 20px; }}
+            .meta-item {{
+                position: relative;
+                background: var(--surface);
+                padding: 18px 20px;
+                transition: background-color var(--dur-med) var(--ease-out);
+            }}
+            .meta-item::after {{
+                content: "";
+                position: absolute;
+                left: 20px;
+                right: 20px;
+                bottom: 0;
+                height: 1px;
+                background: var(--gold);
+                transform: scaleX(0);
+                transform-origin: 0 50%;
+                transition: transform 0.5s var(--ease-out);
+            }}
+            .meta-item:hover {{ background: var(--surface-2); }}
+            .meta-item:hover::after {{ transform: scaleX(1); }}
             .meta-label {{
                 font-size: 10.5px;
                 letter-spacing: 0.1em;
@@ -1898,26 +1975,13 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             .meta-value.is-small {{ font-size: 13px; letter-spacing: 0.01em; }}
             .meta-value .muted {{ font-size: 11.5px; color: var(--text-tertiary); }}
             
-            /* Section：结构样式来自 design_system，这里只加首页的金色下划线点缀 */
-            .section-head {{ position: relative; }}
-            .section-head::after {{
-                content: "";
-                position: absolute;
-                bottom: -1px;
-                left: 0;
-                width: 72px;
-                height: 1px;
-                background: var(--gold);
-                opacity: 0.7;
-            }}
-            
             /* Panels / cards */
             .panel {{
                 background: var(--surface);
                 border: 1px solid var(--border);
                 border-radius: var(--radius-lg);
                 padding: 32px;
-                transition: all 0.35s var(--ease-out);
+                transition: border-color var(--dur-med) var(--ease-out), box-shadow var(--dur-med) var(--ease-out);
                 box-shadow: var(--shadow-sm);
                 position: relative;
                 overflow: hidden;
@@ -1931,14 +1995,13 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 height: 1px;
                 background: linear-gradient(90deg, var(--gold), transparent 60%);
                 opacity: 0;
-                transition: opacity 0.3s ease;
+                transition: opacity 0.5s var(--ease-out);
             }}
             .panel:hover {{
                 border-color: var(--border-strong);
-                transform: translateY(-3px);
                 box-shadow: var(--shadow-md);
             }}
-            .panel:hover::before {{ opacity: 0.5; }}
+            .panel:hover::before {{ opacity: 0.6; }}
             
             /* Core thesis：正文与右侧风险栏字号原本 32px vs 11px，
                层级完全倒置；这里压到可比的区间并按句拆段。 */
@@ -1961,43 +2024,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 border-radius: 2px;
             }}
             
-            /* Logo styles */
-            .logo-wrap {{
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                overflow: hidden;
-            }}
-            .symbol-cell {{
-                display: flex;
-                align-items: center;
-                gap: 10px;
-            }}
-            .row-logo-wrap {{
-                width: 28px;
-                height: 28px;
-                border-radius: 8px;
-                background: var(--surface-2);
-                border: 1px solid var(--border);
-                box-shadow: inset 0 1px 2px rgba(0,0,0,0.1);
-            }}
-            .row-logo {{
-                width: 100%;
-                height: 100%;
-                object-fit: contain;
-                padding: 3px;
-            }}
-            .row-logo-fallback {{
-                display: none;
-                width: 100%;
-                height: 100%;
-                background: var(--gold-dim);
-                color: var(--gold);
-                font-size: 11px;
-                align-items: center;
-                justify-content: center;
-                font-weight: 700;
-            }}
+            /* Logo：行内小标的样式来自 design_system，这里只补资产卡片的大号 logo */
             .asset-logo-wrap {{
                 width: 48px;
                 height: 48px;
@@ -2015,7 +2042,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             .source-badge {{
                 display: inline-flex;
                 align-items: center;
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 9px;
                 font-weight: 700;
                 letter-spacing: 0.08em;
@@ -2043,6 +2070,14 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 background: var(--surface-2);
             }}
             .dist-seg {{ display: block; height: 100%; }}
+            @media (prefers-reduced-motion: no-preference) {{
+                .js-motion .dist-bar {{ transform-origin: 0 50%; }}
+                .js-motion .stagger:not(.is-visible) .dist-bar {{ transform: scaleX(0); }}
+                .js-motion .stagger.is-visible .dist-bar {{
+                    animation: barGrow 1.1s var(--ease-out) backwards;
+                    animation-delay: calc(var(--stagger-i, 0) * 70ms + 0.35s);
+                }}
+            }}
             .dist-bull {{ background: var(--bull); }}
             .dist-hold {{ background: var(--neutral); }}
             .dist-bear {{ background: var(--bear); }}
@@ -2050,7 +2085,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 display: flex;
                 justify-content: space-between;
                 margin-top: 6px;
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 10px;
                 color: var(--text-tertiary);
             }}
@@ -2105,13 +2140,15 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 flex-wrap: wrap;
             }}
             .rating-toolbar-label {{
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 10px;
                 letter-spacing: 0.12em;
                 text-transform: uppercase;
                 color: var(--text-tertiary);
             }}
             .rating-segment {{
+                position: relative;
+                isolation: isolate;
                 display: inline-flex;
                 align-items: center;
                 padding: 3px;
@@ -2127,18 +2164,35 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 cursor: pointer;
                 color: var(--text-secondary);
                 background: transparent;
-                font: 500 12px "Bricolage Grotesk", sans-serif;
-                transition: all 0.2s var(--ease-out);
+                font: 500 12px var(--font-sans);
+                transition: color var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out);
             }}
             .rating-control:hover {{ color: var(--text); }}
+            .rating-control:active {{ transform: scale(0.97); }}
             .rating-control.active {{
                 color: var(--bg);
                 background: var(--gold);
                 font-weight: 600;
                 box-shadow: 0 2px 8px var(--gold-glow);
             }}
+            /* 脚本接管后，选中底色交给一颗在按钮间滑动的胶囊 */
+            .segment-pill {{
+                position: absolute;
+                top: 3px;
+                bottom: 3px;
+                left: 0;
+                z-index: -1;
+                border-radius: 999px;
+                background: var(--gold);
+                box-shadow: 0 2px 10px var(--gold-glow);
+                pointer-events: none;
+            }}
+            .rating-segment.pill-ready .segment-pill {{
+                transition: transform 0.45s var(--ease-spring), width 0.45s var(--ease-out);
+            }}
+            .rating-segment.has-pill .rating-control.active {{ background: transparent; box-shadow: none; }}
             .rating-visible-count {{
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 11px;
                 color: var(--text-secondary);
             }}
@@ -2167,7 +2221,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 color: var(--text-secondary);
                 background: var(--surface);
                 cursor: pointer;
-                font: 500 12px "Bricolage Grotesk", sans-serif;
+                font: 500 12px var(--font-sans);
                 transition: border-color .2s ease, color .2s ease, background .2s ease;
             }}
             .rating-page-btn:hover:not(:disabled) {{
@@ -2182,7 +2236,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             .rating-page-status {{
                 min-width: 78px;
                 text-align: center;
-                font: 11px "JetBrains Mono", monospace;
+                font: 11px var(--font-mono);
                 color: var(--text-secondary);
             }}
 
@@ -2260,12 +2314,18 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 border: 1px solid var(--border);
                 border-radius: var(--radius-md);
                 background: color-mix(in srgb, var(--surface-2) 58%, transparent);
-                transition: border-color .2s var(--ease-out), transform .2s var(--ease-out);
+                transition:
+                    border-color var(--dur-fast) var(--ease-out),
+                    transform var(--dur-med) var(--ease-spring),
+                    background-color var(--dur-fast) var(--ease-out);
             }}
             .attention-item:hover {{
-                transform: translateY(-1px);
-                border-color: var(--border-strong);
+                transform: translateY(-2px);
+                border-color: color-mix(in srgb, var(--gold) 45%, var(--border-strong));
+                background: var(--surface-2);
             }}
+            .attention-item:hover .attention-rank {{ color: var(--gold); }}
+            .attention-rank {{ transition: color var(--dur-fast) var(--ease-out); }}
             .attention-rank {{
                 padding-top: 2px;
                 color: var(--text-tertiary);
@@ -2275,10 +2335,15 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             .attention-item-main {{ min-width: 0; }}
             .attention-item-top {{
                 display: flex;
-                align-items: baseline;
+                align-items: center;
                 justify-content: space-between;
                 gap: 8px;
             }}
+            .attention-symbol-cell {{
+                gap: 8px;
+                min-width: 0;
+            }}
+            .attention-symbol-cell .attention-symbol {{ min-width: 0; }}
             .attention-symbol {{
                 overflow: hidden;
                 color: var(--text);
@@ -2311,6 +2376,14 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 height: 100%;
                 border-radius: inherit;
                 background: linear-gradient(90deg, var(--gold), var(--gold-bright));
+                transform-origin: 0 50%;
+            }}
+            @media (prefers-reduced-motion: no-preference) {{
+                .js-motion .attention-list.stagger:not(.is-visible) .attention-track span {{ transform: scaleX(0); }}
+                .js-motion .attention-list.stagger.is-visible .attention-track span {{
+                    animation: barGrow 1s var(--ease-out) backwards;
+                    animation-delay: calc(var(--stagger-i, 0) * 70ms + 0.3s);
+                }}
             }}
             .attention-institutions {{
                 color: var(--text-tertiary);
@@ -2403,6 +2476,12 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             .rating-table .cell-pt {{ white-space: nowrap; }}
             .rating-table .cell-evidence {{ width: 96px; }}
             .rating-table tbody td {{ padding: 13px 14px; }}
+            @media (prefers-reduced-motion: no-preference) {{
+                .rating-table tbody.is-swapping tr {{
+                    animation: rowIn 0.42s var(--ease-out) backwards;
+                    animation-delay: calc(var(--row-i, 0) * 14ms);
+                }}
+            }}
             .rating-time {{ white-space: nowrap; }}
             .reaction-table-wrap table {{ min-width: 860px; }}
             .pt-empty {{ color: var(--text-tertiary); cursor: help; }}
@@ -2456,6 +2535,10 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 border-radius: var(--radius-md);
                 background: var(--surface);
                 box-shadow: var(--shadow-sm);
+                transition:
+                    border-color var(--dur-med) var(--ease-out),
+                    box-shadow var(--dur-med) var(--ease-out),
+                    transform var(--dur-med) var(--ease-out);
             }}
             .institution-card::after {{
                 content: "";
@@ -2466,7 +2549,20 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 height: 130px;
                 border: 1px solid var(--border);
                 border-radius: 50%;
+                pointer-events: none;
+                transition: transform 0.7s var(--ease-out), border-color 0.7s var(--ease-out);
             }}
+            .institution-card:hover {{
+                border-color: color-mix(in srgb, var(--gold) 40%, var(--border-strong));
+                box-shadow: var(--shadow-md);
+                transform: translateY(-3px);
+            }}
+            .institution-card:hover::after {{
+                transform: scale(1.35);
+                border-color: color-mix(in srgb, var(--gold) 35%, transparent);
+            }}
+            .institution-card-head > a {{ transition: color var(--dur-fast) var(--ease-out); }}
+            .institution-card-head > a:hover {{ color: var(--gold); }}
             .institution-card-head {{
                 display: flex;
                 align-items: center;
@@ -2486,7 +2582,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 gap: 7px 14px;
                 margin-bottom: 13px;
                 color: var(--text-secondary);
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 11px;
             }}
             .institution-card p {{
@@ -2503,8 +2599,13 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 color: var(--text-tertiary);
                 font-size: 11px;
             }}
-            .institution-symbols {{ display: flex; flex-wrap: wrap; gap: 7px; }}
-            .institution-symbols a {{ color: var(--gold); text-decoration: none; }}
+            .institution-symbols {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+            .institution-symbol {{
+                color: var(--text);
+                text-decoration: none;
+                gap: 6px;
+            }}
+            .institution-symbol:hover {{ color: var(--gold); }}
             .tone-badge {{
                 display: inline-flex;
                 align-items: center;
@@ -2575,21 +2676,29 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 box-shadow: var(--shadow-md), 0 0 30px var(--gold-glow);
             }}
             .asset-card:hover::before {{ opacity: 0.6; }}
+            .asset-card:hover .row-logo {{ transform: scale(1.08); }}
             .asset-header {{
                 display: flex;
                 justify-content: space-between;
-                align-items: baseline;
-                margin-bottom: 10px;
+                align-items: center;
+                gap: 12px;
+                margin-bottom: 12px;
+            }}
+            .asset-header-meta {{
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                flex: 0 0 auto;
             }}
             .asset-ticker {{
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 22px;
                 font-weight: 700;
                 color: var(--text);
                 letter-spacing: -0.02em;
             }}
             .asset-target {{
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 16px;
                 color: var(--gold);
                 font-weight: 600;
@@ -2621,7 +2730,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             .change-up {{ color: var(--bull); }}
             .change-down {{ color: var(--bear); }}
             .change-flat {{ color: var(--text-secondary); }}
-            .change-new {{ color: var(--accent); }}
             .change-old {{
                 color: var(--text-tertiary);
                 text-decoration: line-through;
@@ -2633,7 +2741,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             .change-bank {{ color: var(--text); font-weight: 500; }}
             .change-time {{
                 color: var(--text-secondary);
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
             }}
             .change-divider {{ color: var(--text-tertiary); }}
             
@@ -2737,14 +2845,15 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 justify-content: space-between;
                 flex-wrap: wrap;
                 gap: 20px;
-                margin-top: 56px;
-                padding: 28px 32px;
+                margin-top: 48px;
+                padding: 26px 30px;
                 border: 1px solid var(--border);
                 border-radius: var(--radius-lg);
                 background: linear-gradient(135deg, var(--gold-dim) 0%, transparent 60%);
                 position: relative;
                 overflow: hidden;
             }}
+            .bmc-text {{ flex: 1 1 320px; }}
             .bmc-panel::before {{
                 content: "";
                 position: absolute;
@@ -2776,14 +2885,56 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 align-items: center;
                 justify-content: space-between;
                 flex-wrap: wrap;
-                gap: 20px;
-                margin-top: 18px;
-                padding: 24px 32px;
+                gap: 16px;
+                margin-top: 16px;
+                padding: 22px 30px;
                 border: 1px solid var(--border);
                 border-radius: var(--radius-lg);
                 background: var(--surface);
                 box-shadow: var(--shadow-sm);
             }}
+            .contact-panel > .contact-text {{ flex: 1 1 240px; }}
+            .contact-panel > a {{ flex: 0 0 auto; }}
+            .x-icon-link {{
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                width: 36px;
+                height: 36px;
+                color: var(--gold);
+                border: 1px solid var(--border);
+                border-radius: 999px;
+                text-decoration: none;
+                transition:
+                    border-color var(--dur-fast) var(--ease-out),
+                    background-color var(--dur-fast) var(--ease-out),
+                    box-shadow var(--dur-med) var(--ease-out),
+                    transform var(--dur-med) var(--ease-spring);
+            }}
+            .x-icon-link:hover {{
+                border-color: var(--gold);
+                background: var(--gold-dim);
+                transform: translateY(-2px);
+                box-shadow: 0 6px 18px var(--gold-glow);
+            }}
+            .refresh-controls .x-icon-link {{ width: 32px; height: 32px; }}
+            .disclaimer-panel {{
+                margin-top: 16px;
+                padding: 18px 30px;
+                border: 1px solid var(--border);
+                border-radius: var(--radius-lg);
+                background: var(--surface);
+            }}
+            .disclaimer-title {{
+                margin-bottom: 6px;
+                color: var(--gold);
+                font-family: var(--font-mono);
+                font-size: 10.5px;
+                font-weight: 600;
+                letter-spacing: 0.14em;
+                text-transform: uppercase;
+            }}
+            .disclaimer-body {{ font-size: 12px; line-height: 1.75; color: var(--text-secondary); }}
             .contact-title {{
                 font-size: 16px;
                 font-weight: 600;
@@ -2799,38 +2950,58 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 align-items: center;
                 gap: 8px;
                 color: var(--gold);
-                font-family: "JetBrains Mono", monospace;
+                font-family: var(--font-mono);
                 font-size: 13px;
                 text-decoration: none;
                 border: 1px solid var(--border);
                 border-radius: 999px;
-                padding: 10px 18px;
-                transition: all 0.25s var(--ease-out);
+                padding: 9px 17px;
+                transition:
+                    border-color var(--dur-fast) var(--ease-out),
+                    background-color var(--dur-fast) var(--ease-out),
+                    transform var(--dur-med) var(--ease-spring);
                 font-weight: 500;
             }}
             .contact-btn:hover {{
                 border-color: var(--gold);
                 background: var(--gold-dim);
+                text-decoration: none;
                 transform: translateY(-1px);
             }}
             .bmc-btn {{
+                position: relative;
+                overflow: hidden;
                 display: inline-flex;
                 align-items: center;
                 gap: 8px;
                 background: var(--gold);
                 color: var(--bg);
-                font-weight: 700;
-                padding: 12px 22px;
+                font-weight: 600;
+                padding: 11px 20px;
                 border-radius: 999px;
                 text-decoration: none;
-                transition: all 0.25s var(--ease-out);
+                transition:
+                    transform var(--dur-med) var(--ease-spring),
+                    box-shadow var(--dur-med) var(--ease-out),
+                    background-color var(--dur-fast) var(--ease-out);
                 box-shadow: 0 4px 16px var(--gold-glow);
+            }}
+            .bmc-btn::after {{
+                content: "";
+                position: absolute;
+                inset: 0;
+                background: linear-gradient(110deg, transparent 30%, rgba(255, 255, 255, 0.38) 50%, transparent 70%);
+                transform: translateX(-120%);
+                transition: transform 0.8s var(--ease-out);
+                pointer-events: none;
             }}
             .bmc-btn:hover {{
                 transform: translateY(-2px);
                 box-shadow: 0 8px 28px var(--gold-glow);
                 background: var(--gold-bright);
+                text-decoration: none;
             }}
+            .bmc-btn:hover::after {{ transform: translateX(120%); }}
             
             /* Toast */
             .toast {{
@@ -2845,9 +3016,9 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 border-radius: var(--radius-md);
                 font-size: 13px;
                 font-weight: 500;
-                transform: translateY(140%);
+                transform: translateY(140%) scale(0.96);
                 opacity: 0;
-                transition: all 0.4s var(--ease-out);
+                transition: transform 0.55s var(--ease-spring), opacity 0.3s var(--ease-out), border-color 0.2s;
                 box-shadow: var(--shadow-lg);
                 max-width: 360px;
                 line-height: 1.5;
@@ -2860,7 +3031,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             /* Responsive */
             @media (max-width: 900px) {{
                 .wrap {{ padding: 36px 20px 70px; }}
-                .hero {{ grid-template-columns: 1fr; gap: 40px; }}
                 .split-grid {{ grid-template-columns: 1fr; }}
                 .digest-panel {{ grid-template-columns: 1fr; }}
                 .digest-risks {{ padding: 22px 0 0; border-left: 0; border-top: 1px solid var(--border-strong); }}
@@ -2890,29 +3060,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             @media (max-width: 420px) {{
                 .attention-list {{ grid-template-columns: 1fr; }}
             }}
-            .site-nav {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 8px 16px;
-                align-items: center;
-                margin-bottom: 18px;
-            }}
-            .site-nav .brand {{
-                font-family: var(--font-serif);
-                font-size: 20px;
-                color: var(--text);
-                margin-right: 8px;
-                text-decoration: none;
-            }}
-            .site-nav a {{
-                color: var(--text-secondary);
-                font-size: 13px;
-                text-decoration: none;
-            }}
-            .site-nav a:hover,
-            .site-nav a[aria-current="page"] {{
-                color: var(--gold);
-            }}
             a.asset-chip,
             a.asset-ticker,
             a.symbol {{
@@ -2924,16 +3071,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             a.symbol:hover {{
                 color: var(--gold);
             }}
-            .footer-nav {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 10px 16px;
-                margin-top: 28px;
-                padding-top: 16px;
-                border-top: 1px solid var(--border);
-                font-size: 13px;
-            }}
-            .footer-nav a {{ color: var(--text-secondary); }}
             .stock-strip {{
                 display: flex;
                 flex-wrap: wrap;
@@ -2962,8 +3099,8 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
 
         <div id="generatedAt" data-time="{safe_generated_at_attr}" style="display:none"></div>
 
-        <section class="hero reveal reveal-delay-1">
-            <h1 class="hero-title serif">投行目标价、<em>研报观点</em><br>与市场验证</h1>
+        <section class="hero">
+            <h1 class="hero-title serif"><span class="hero-line"><span>投行目标价、<em>研报观点</em></span></span><span class="hero-line"><span>与市场验证</span></span></h1>
             <p class="hero-sub">
                 汇总 Goldman Sachs、Morgan Stanley、JPMorgan 等机构对关注股票的评级、目标价与公开研报观点；
                 合并同一标的的机构共识与分歧，再追踪观点发布后 1、5、20 个交易日相对 SPY 的表现。
@@ -2995,7 +3132,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             </div>
         </div>
 
-        <section class="section reveal reveal-delay-2">
+        <section class="section reveal reveal-delay-5">
             <div class="section-head">
                 <h2 class="section-title">本期研报观点整合</h2>
                 <span class="section-count">01</span>
@@ -3012,7 +3149,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             </div>
         </section>
 
-        <section class="section reveal reveal-delay-3" id="latest-calls">
+        <section class="section reveal-scroll" id="latest-calls">
             <div class="section-head">
                 <h2 class="section-title">最新评级与目标价动作</h2>
                 <span class="section-count" id="ratingSectionCount">近 30 天 · 关注池 · 共 {tracked_change_count} 条</span>
@@ -3065,7 +3202,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                         <span><strong id="attentionSymbolCount">{stock_attention_symbol_count}</strong> 只股票</span>
                     </div>
                 </div>
-                <ol class="attention-list" id="stockAttentionList">
+                <ol class="attention-list stagger" id="stockAttentionList">
                     {stock_attention_html}
                 </ol>
             </aside>
@@ -3076,7 +3213,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 </div>
                 <input class="rating-scroll-top" id="ratingScrollTop" type="range" min="0" max="0" value="0" step="1" aria-label="向右拖动查看完整日期" aria-controls="ratingTableWrap">
             </div>
-            <div class="table-wrap rating-table-wrap reveal" id="ratingTableWrap">
+            <div class="table-wrap rating-table-wrap" id="ratingTableWrap">
                 <table class="rating-table">
                     <thead>
                         <tr>
@@ -3109,28 +3246,28 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             </div>
         </section>
 
-        <section class="section reveal reveal-delay-4" id="price-targets">
+        <section class="section reveal-scroll" id="price-targets">
             <div class="section-head">
                 <h2 class="section-title">股票目标价快照</h2>
                 <span class="section-count">{len(asset_targets):02d}</span>
             </div>
-            <div class="asset-grid">
+            <div class="asset-grid stagger">
                 {asset_cards}
             </div>
         </section>
 
-        <section class="section reveal reveal-delay-4" id="institution-views">
+        <section class="section reveal-scroll" id="institution-views">
             <div class="section-head">
                 <h2 class="section-title">机构公开倾向与观点蒸馏</h2>
                 <span class="section-count">{institution_count:02d}</span>
             </div>
             <p class="section-intro">把同一机构近 30 天对关注池股票的评级、目标价动作合并，再看这些公开表态有没有得到后续价格确认。</p>
-            <div class="institution-grid">
+            <div class="institution-grid stagger">
                 {institution_cards_html}
             </div>
         </section>
 
-        <section class="section reveal reveal-delay-5" id="market-reactions">
+        <section class="section reveal-scroll" id="market-reactions">
             <div class="section-head">
                 <h2 class="section-title">机构观点后的市场反应</h2>
                 <span class="section-count">方向样本 {evaluated_event_count:02d}</span>
@@ -3149,7 +3286,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             </div>
         </section>
 
-        <footer class="footer reveal reveal-delay-5">
+        <footer class="footer reveal-scroll">
             <div>
                 数据来源: {sources_html} · 处理: 公开来源归集、事件去重、目标价分级与市场反应计算
             </div>
@@ -3159,7 +3296,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         </footer>
 
         <!-- Buy Me a Coffee -->
-        <div class="bmc-panel reveal reveal-delay-5">
+        <div class="bmc-panel reveal-scroll">
             <div class="bmc-text">
                 <div class="bmc-title">自愿支持本站维护</div>
                 <div class="bmc-sub">如果这份整理对你有帮助，可以自愿请我喝杯咖啡，用于服务器、数据与日常维护。</div>
@@ -3169,7 +3306,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         </div>
 
         <!-- Contact -->
-        <div class="contact-panel reveal reveal-delay-5">
+        <div class="contact-panel reveal-scroll">
             <div class="contact-text">
                 <div class="contact-title">有反馈或建议？</div>
                 <div class="contact-sub">欢迎发邮件交流，或告诉我你希望新增的数据源与功能。</div>
@@ -3182,7 +3319,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         </div>
 
         <!-- Compliance Disclaimer -->
-        <div class="disclaimer-panel reveal reveal-delay-5">
+        <div class="disclaimer-panel reveal-scroll">
             <div class="disclaimer-title">研究边界与免责声明</div>
             <div class="disclaimer-body">
                 FResearch 基于公开新闻标题、评级、目标价字段与可公开摘要进行归集，不复述受版权保护的完整研报。
@@ -3192,60 +3329,6 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         </div>
         {homepage_footer_nav_html()}
     </div>
-
-    <style>
-        .bmc-panel {{
-            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;
-            margin-top: 48px; padding: 24px 28px;
-            border: 1px solid var(--border); border-radius: 16px;
-            background: linear-gradient(135deg, rgba(201,164,92,0.08) 0%, transparent 60%);
-        }}
-        .bmc-title {{ font-size: 16px; font-weight: 600; color: var(--text); }}
-        .bmc-sub {{ font-size: 13px; color: var(--muted); margin-top: 4px; }}
-        .bmc-disclaimer {{ font-size: 11px; color: var(--muted); margin-top: 7px; opacity: 0.86; }}
-        .contact-panel {{
-            display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;
-            margin-top: 16px; padding: 20px 28px;
-            border: 1px solid var(--border); border-radius: 16px;
-            background: var(--surface);
-        }}
-        .contact-panel > .contact-text {{ flex: 1 1 240px; }}
-        .contact-panel > a {{ flex: 0 0 auto; }}
-        .x-icon-link {{
-            display: inline-flex; align-items: center; justify-content: center;
-            width: 36px; height: 36px; color: var(--gold);
-            border: 1px solid var(--border); border-radius: 999px;
-            text-decoration: none; transition: all 0.2s ease;
-        }}
-        .x-icon-link:hover {{
-            border-color: var(--gold); background: var(--gold-dim);
-            transform: translateY(-2px); box-shadow: 0 6px 18px rgba(201,164,92,0.22);
-        }}
-        .refresh-controls .x-icon-link {{ width: 32px; height: 32px; }}
-        .contact-title {{ font-size: 15px; font-weight: 600; color: var(--text); }}
-        .contact-sub {{ font-size: 13px; color: var(--muted); margin-top: 3px; }}
-        .contact-btn {{
-            display: inline-flex; align-items: center; gap: 8px;
-            color: var(--gold); font-family: "IBM Plex Mono", monospace; font-size: 13px;
-            text-decoration: none; border: 1px solid var(--border); border-radius: 999px;
-            padding: 8px 16px; transition: all 0.2s ease;
-        }}
-        .contact-btn:hover {{ border-color: var(--gold); background: var(--gold-dim); }}
-        .bmc-btn {{
-            display: inline-flex; align-items: center; gap: 8px;
-            background: var(--gold); color: var(--bg); font-weight: 600;
-            padding: 10px 18px; border-radius: 999px; text-decoration: none;
-            transition: transform 0.2s ease, box-shadow 0.2s ease;
-        }}
-        .bmc-btn:hover {{ transform: translateY(-2px); box-shadow: 0 8px 24px rgba(201,164,92,0.25); }}
-        .disclaimer-panel {{
-            margin-top: 16px; padding: 18px 28px;
-            border: 1px solid var(--border); border-radius: 16px;
-            background: var(--surface);
-        }}
-        .disclaimer-title {{ font-size: 12px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--gold); margin-bottom: 6px; }}
-        .disclaimer-body {{ font-size: 12px; line-height: 1.7; color: var(--muted); }}
-    </style>
 
     <div class="toast" id="toast"></div>
     <script>
@@ -3279,6 +3362,37 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             const dates = ledger.map(item => item.d).filter(Boolean);
             if (dates.length) return dates.reduce((a, b) => (a > b ? a : b));
             return new Date().toISOString().slice(0, 10);
+        }}
+        function attentionLogoUrl(symbol) {{
+            // 与服务端 _normalize_logo_symbol 同一套收敛规则
+            const normalized = String(symbol || '').trim().toUpperCase()
+                .replace(/[./]/g, '-')
+                .replace(/\\s+/g, ' ')
+                .replace(/[^A-Z0-9 _-]/g, '')
+                .trim()
+                .slice(0, 32);
+            if (!normalized) return '';
+            return `/assets/logos/${{encodeURIComponent(normalized)}}.svg?v=3`;
+        }}
+        function buildAttentionLogo(symbol) {{
+            const url = attentionLogoUrl(symbol);
+            if (!url) return null;
+            const wrap = document.createElement('span');
+            wrap.className = 'logo-wrap row-logo-wrap';
+            const img = document.createElement('img');
+            img.className = 'row-logo';
+            img.src = url;
+            img.alt = '';
+            img.loading = 'lazy';
+            img.onerror = function() {{
+                this.style.display = 'none';
+                if (this.nextElementSibling) this.nextElementSibling.style.display = 'flex';
+            }};
+            const fallback = document.createElement('span');
+            fallback.className = 'row-logo-fallback';
+            fallback.textContent = (symbol && symbol[0]) || '?';
+            wrap.append(img, fallback);
+            return wrap;
         }}
         function renderStockAttention(scoped) {{
             const list = document.getElementById('stockAttentionList');
@@ -3316,6 +3430,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             visible.forEach((row, index) => {{
                 const item = document.createElement('li');
                 item.className = 'attention-item';
+                item.style.setProperty('--stagger-i', String(index));
 
                 const rank = document.createElement('div');
                 rank.className = 'attention-rank';
@@ -3325,16 +3440,21 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 main.className = 'attention-item-main';
                 const top = document.createElement('div');
                 top.className = 'attention-item-top';
+                const symbolCell = document.createElement('span');
+                symbolCell.className = 'symbol-cell attention-symbol-cell';
+                const logo = buildAttentionLogo(row.symbol);
+                if (logo) symbolCell.appendChild(logo);
                 const symbol = document.createElement(row.url ? 'a' : 'span');
                 symbol.className = 'attention-symbol';
                 symbol.textContent = row.symbol;
                 if (row.url) symbol.setAttribute('href', row.url);
+                symbolCell.appendChild(symbol);
                 const count = document.createElement('span');
                 count.className = 'attention-count';
                 const countStrong = document.createElement('strong');
                 countStrong.textContent = String(row.mentions);
                 count.append(countStrong, document.createTextNode(' 次'));
-                top.append(symbol, count);
+                top.append(symbolCell, count);
 
                 const track = document.createElement('div');
                 track.className = 'attention-track';
@@ -3416,6 +3536,10 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             }} else {{
                 tbody.innerHTML = pageItems.map(item => item.h).join('');
             }}
+            tbody.classList.remove('is-swapping');
+            Array.from(tbody.rows).forEach((row, index) => row.style.setProperty('--row-i', String(index)));
+            void tbody.offsetWidth;
+            tbody.classList.add('is-swapping');
             if (ratingView.sort === 'symbol') {{
                 let previousSymbol = null;
                 Array.from(tbody.querySelectorAll('.rating-row')).forEach(row => {{
@@ -3450,6 +3574,24 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             scheduleVisibleLogoRefresh();
             updateRatingScrollMirror();
         }}
+        function syncRatingSegments() {{
+            document.querySelectorAll('.rating-segment').forEach(segment => {{
+                let pill = segment.querySelector('.segment-pill');
+                if (!pill) {{
+                    pill = document.createElement('span');
+                    pill.className = 'segment-pill';
+                    pill.setAttribute('aria-hidden', 'true');
+                    segment.prepend(pill);
+                    segment.classList.add('has-pill');
+                    requestAnimationFrame(() => requestAnimationFrame(() => segment.classList.add('pill-ready')));
+                }}
+                const active = segment.querySelector('.rating-control.active');
+                pill.style.opacity = active ? '1' : '0';
+                if (!active) return;
+                pill.style.width = `${{active.offsetWidth}}px`;
+                pill.style.transform = `translateX(${{active.offsetLeft}}px)`;
+            }});
+        }}
         function setRatingUniverse(universe) {{
             ratingView.universe = universe === 'tracked' ? 'tracked' : 'all';
             ratingView.page = 1;
@@ -3458,6 +3600,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 button.classList.toggle('active', active);
                 button.setAttribute('aria-pressed', active ? 'true' : 'false');
             }});
+            syncRatingSegments();
             applyRatingView();
         }}
         function setRatingWindow(days) {{
@@ -3468,6 +3611,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 button.classList.toggle('active', active);
                 button.setAttribute('aria-pressed', active ? 'true' : 'false');
             }});
+            syncRatingSegments();
             applyRatingView();
         }}
         function setRatingSort(mode) {{
@@ -3478,6 +3622,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
                 button.classList.toggle('active', active);
                 button.setAttribute('aria-pressed', active ? 'true' : 'false');
             }});
+            syncRatingSegments();
             applyRatingView();
         }}
         function changeRatingPage(delta) {{
@@ -3582,6 +3727,8 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         // 首屏的行、计数与分页状态都由服务端给出，加载时不调 applyRatingView，
         // 于是 1MB 级的账本 JSON 完全不进首屏关键路径。
         setupRatingScrollMirror();
+        syncRatingSegments();
+        window.addEventListener('resize', syncRatingSegments, {{ passive: true }});
         scheduleVisibleLogoRefresh();
         updateRelativeTime();
         setInterval(updateRelativeTime, 60000);
@@ -3592,6 +3739,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
             }}
         }});
     </script>
+    {MOTION_SCRIPT}
 </body>
 </html>"""
     return html

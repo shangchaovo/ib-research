@@ -16,7 +16,7 @@ from xml.sax.saxutils import escape as xml_escape
 
 from flask import Response, abort, redirect
 
-from design_system import PAGE_CSS
+from design_system import MOTION_HEAD_SCRIPT, MOTION_SCRIPT, PAGE_CSS
 from ib_research_fetcher import HOT_SYMBOLS, TARGET_BANKS, get_latest_report
 from institution_intelligence import ACTION_LABELS, TRACKED_INSTITUTIONS, build_institution_intelligence
 
@@ -727,7 +727,7 @@ _GEO_ONLY_CSS = """
     display: inline-block;
     border-radius: 2px;
 }
-.pt-legend-marker { width: 3px; height: 12px; background: var(--text-primary); }
+.pt-legend-marker { width: 3px; height: 12px; background: var(--text); }
 .pt-legend-span { width: 16px; height: 4px; margin-left: 6px; background: var(--accent); opacity: 0.75; }
 @media (max-width: 640px) {
     .pt-range-legend { display: none; }
@@ -911,6 +911,7 @@ def seo_head(
 <meta name="twitter:image:alt" content="{og_title}">
 {modified_tag}
 {"".join(_json_ld(item) for item in schemas)}
+{MOTION_HEAD_SCRIPT}
 {f"<style>{_GEO_CSS}</style>" if include_style else ""}
 """
 
@@ -938,6 +939,7 @@ def render_page(
 {site_footer_nav_html()}
 </div>
 {THEME_SCRIPT}
+{MOTION_SCRIPT}
 </body>
 </html>"""
 
@@ -1328,9 +1330,16 @@ def _institution_intelligence(report: dict) -> dict:
 
 
 def _logo_img(symbol: str, css_class: str = "logo") -> str:
+    """与看板评级行同一套圆角标：真实 logo，加载失败时退回首字母。"""
+    del css_class
+    initial = _safe_text((str(symbol or "?")[:1]) or "?")
     return (
-        f'<img class="{css_class}" src="/assets/logos/{quote(symbol, safe="-")}.svg?v=2" '
-        f'alt="" width="36" height="36">'
+        '<span class="logo-wrap row-logo-wrap">'
+        f'<img class="row-logo" src="/assets/logos/{quote(str(symbol or ""), safe="-")}.svg?v=3" '
+        'alt="" loading="lazy" '
+        "onerror=\"this.style.display='none'; this.nextElementSibling.style.display='flex';\">"
+        f'<span class="row-logo-fallback">{initial}</span>'
+        '</span>'
     )
 
 
@@ -1455,7 +1464,11 @@ def _reaction_table(events: list[dict], include_institution: bool = True) -> str
         rows.append(
             "<tr>"
             + institution_cell
-            + f'<td><a href="/stocks/{_safe_attr(str(event.get("symbol") or "").lower())}/">{_safe_text(event.get("symbol"))}</a></td>'
+            + (
+                f'<td><a class="symbol-cell" href="/stocks/{_safe_attr(str(event.get("symbol") or "").lower())}/">'
+                f'{_logo_img(str(event.get("symbol") or ""))}'
+                f'<span class="symbol">{_safe_text(event.get("symbol"))}</span></a></td>'
+            )
             + f'<td>{action}</td>'
             + f'<td class="mono">{_safe_text(event.get("price_target") or "—")}</td>'
             + f'<td class="mono">{_safe_text(_percent(excess.get("1d")))}</td>'
@@ -1524,7 +1537,7 @@ def render_stocks_index(report: dict) -> str:
         mark = "有目标价" if ticker in covered else "跟踪中"
         rows.append(
             "<tr>"
-            f'<td><a href="/stocks/{ticker.lower()}/">{_logo_img(ticker)}{_safe_text(ticker)}</a></td>'
+            f'<td><a class="symbol-cell" href="/stocks/{ticker.lower()}/">{_logo_img(ticker)}<span class="symbol">{_safe_text(ticker)}</span></a></td>'
             f'<td>{_safe_text(profile["name_zh"])} / {_safe_text(profile["name"])}</td>'
             f'<td>{_safe_text(profile["sector_zh"])}</td>'
             f'<td class="muted">{_safe_text(mark)}</td>'
@@ -1633,7 +1646,7 @@ def render_stock_page(symbol: str, report: dict) -> str:
     generated = slice_data["generated_at"]
     body = f"""
 {crumb}
-<h1>{_logo_img(symbol)}{_safe_text(profile["name_zh"])}（{_safe_text(symbol)}）投行目标价与观点验证</h1>
+<h1 class="title-with-logo">{_logo_img(symbol)}<span>{_safe_text(profile["name_zh"])}（{_safe_text(symbol)}）投行目标价与观点验证</span></h1>
 <p class="one-liner">{_safe_text(profile["one_liner"])}</p>
 <div class="meta-row">
   <span>交易所：{_safe_text(profile["exchange"])}</span>
@@ -1878,7 +1891,7 @@ def render_compare_page(slug: str, report: dict) -> str:
 
     table = f"""
 <table>
-<thead><tr><th></th><th>{_safe_text(left)}</th><th>{_safe_text(right)}</th></tr></thead>
+<thead><tr><th></th><th><a class="symbol-cell" href="/stocks/{left.lower()}/">{_logo_img(left)}<span class="symbol">{_safe_text(left)}</span></a></th><th><a class="symbol-cell" href="/stocks/{right.lower()}/">{_logo_img(right)}<span class="symbol">{_safe_text(right)}</span></a></th></tr></thead>
 <tbody>
 <tr><td>中文名</td><td>{_safe_text(STOCK_PROFILES[left]['name_zh'])}</td><td>{_safe_text(STOCK_PROFILES[right]['name_zh'])}</td></tr>
 <tr><td>赛道</td><td>{_safe_text(STOCK_PROFILES[left]['industry'])}</td><td>{_safe_text(STOCK_PROFILES[right]['industry'])}</td></tr>
@@ -1995,7 +2008,7 @@ def render_institution_page(slug: str, report: dict) -> str:
   <div class="metric"><b>{_safe_text(alignment)}</b><span>方向一致率</span></div>
   <div class="metric"><b>{_safe_text(aggregate.get('confidence') or '低')}</b><span>样本置信度</span></div>
 </div>
-<div class="panel"><h2>观点蒸馏</h2><p>{_safe_text(aggregate.get('interpretation') or '')}</p><p class="muted">覆盖股票：{_safe_text('、'.join(aggregate.get('symbols') or []) or '—')}</p></div>
+<div class="panel"><h2>观点蒸馏</h2><p>{_safe_text(aggregate.get('interpretation') or '')}</p><h3>覆盖股票</h3>{_stock_chips(list(aggregate.get('symbols') or [])) or '<p class="muted">—</p>'}</div>
 """
     else:
         metrics = '<div class="panel"><p class="empty">最近 30 天关注池内暂无可验证公开动作。</p></div>'
