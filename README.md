@@ -29,6 +29,9 @@
 | `/stocks/<ticker>/` | 现价 vs 一致目标价、公开目标价区间、机构观点时间线 |
 | `/institutions/`、`/institutions/<slug>/` | 各机构公开倾向、覆盖标的、同向率与市场确认样本 |
 | `/reactions/` | 逐事件 1 / 5 / 20 日绝对与相对回报 |
+| `/events/`、`/events/page/2/` | 可回查事件档案，每页 50 条真实 HTML 链接，无 JavaScript 也可遍历 |
+| `/events/<id>/` | 单条评级 / 目标价永久记录，附报道出处、抽取方式、补全标记和时间口径 |
+| `/feed.xml`、`/data/events.json` | 最近 50 条建档记录的 RSS、全量公开事件 JSON |
 | `/topics/` | 目标价、机构观点、市场验证、信号一致性的分析框架 |
 | `/about/` `/methodology/` `/sources/` `/disclosures/` | 品牌、方法、来源与 YMYL 披露 |
 
@@ -41,14 +44,30 @@
 | 入口 | 作用 |
 | --- | --- |
 | `/robots.txt` | 允许 Googlebot / Bingbot / OAI-SearchBot；禁止 `/api/`；`GPTBot` / `CCBot` 默认 Disallow |
-| `/sitemap.xml` | 首页、有实质内容的关注池股票页、已有数据的机构页、市场验证、分析框架与信任页。**没有评级/目标价/新闻的薄股票页不进 sitemap** |
+| `/sitemap.xml` | 首页、有实质内容的关注池股票页、已有数据的机构页、市场验证、分析框架、信任页和永久事件档案。没有评级/目标价/新闻的股票页同时设置 `noindex,follow` |
 | `/llms.txt` | 给生成式系统看的站点说明书；**不是** Google AI Overviews 的前置条件 |
-| JSON-LD | 首页 `CollectionPage`；股票/机构/反应页 `Article`；`SoftwareApplication` 只挂在 `/about/`（首页挂应用类型属于错配） |
+| JSON-LD | 首页与股票 / 机构 / 反应页用 `CollectionPage`；独立事件记录用 `Article`；`SoftwareApplication` 只挂在 `/about/` |
 | 社交卡片 | `og:*` + `twitter:site` / `creator` / `image:alt`；分享图 `/og-image.png` |
 
 FAQ 结构化数据至少两组问答才输出。`mainEntityOfPage` 使用 `WebPage` 对象而不是裸 URL。
 
+日期有证据才输出。事件页的 `datePublished` 对应本站首次建档，`dateModified` / sitemap `lastmod` 对应公开内容的实质变更；重复采集不刷新这些时间。其他集合页没有逐页修改记录时省略 `lastmod`，不把整轮报告刷新当作每页发表日期。
+
 收录检查：`python3 ib_research_seo_monitor.py` 抓公网域名核对验证 meta、robots、sitemap 和关键页面未回归。
+
+## 公开信源档案
+
+新档案只收录具有机构、股票、有效动作与日期、新闻标题和可回查外部链接的 `verified_headline` / `verified_summary` 事件。标签展示为“公开新闻标题 / 摘要规则抽取”，不表示投行审核过本站内容。缺少单条原文的 Yahoo 结构化记录、韩语聚合推断、空来源和模型推断仍可按既有口径出现在总览，但不会因此自动成为永久档案里的可引用记录。
+
+每条记录区分事件记录日期、档案首次观察、首次建档与实质更新时间。推定日期、历史评级回填、新评级推断、目标价补全等随记录公开；报道链接不是完整投行原始研报，也不能证明所有补全字段均来自同一篇报道。
+
+持久档案位于 `IB_RESEARCH_CACHE_DIR/public_events_archive.json`，只保存允许公开的字段，不进入 Git。首次成功采集或静态导出会逐个读取本地仍保留的 `report_YYYY-MM-DD.json` 建档，此后增量更新。已入档事件不受首页 30 天滚动窗口影响。GET 请求只读档案，不采集、不调用模型、不写文件。
+
+事件 ID 由归一后的机构、股票、动作、日期生成；补目标价、评级、标题和链接不会改变 ID。同机构同股票同日同动作按现有账本约定合并，不等同于投行原始研报编号。更正机构 / 日期 / 动作会形成不同身份，旧链接仍保留；目前不自动推断跨日更正或删除旧记录，应人工核对。上线前备份整个运行时数据目录，长期保留档案文件；无法回填已经删除的历史报告。
+
+公开 API `/api/ib-research` 保留 `status` / `data` 外层，`data` 改为字段白名单：必要元信息、公开概述、评级与目标价；不返回 `raw`、内部运行 ID、模型错误、供应商状态和未知新增字段。原始数据 `/api/ib-research/raw` 仅本机可信访问可读，静态发布不再导出 raw JSON。抓取机器数据使用 `/data/events.json`；它允许抓取、设置 `noindex,follow`，引用落到 HTML 永久页。
+
+静态构建固定一份报告和事件快照，目录、详情、RSS、JSON、sitemap 使用相同数据；不会为了 Logo 触发网络抓取。构建校验完成后才替换旧输出，失败保留上一份完整快照。默认拒绝用无有效报告的空缓存覆盖已有发布；`--allow-empty` 只供测试和诊断。
 
 ## 关注池
 
@@ -67,7 +86,7 @@ python3 ib_research_fetcher.py
 python3 ib_research_fetcher.py --fast   # 读 AV 缓存，适合高频 cron
 python3 ib_research_server.py           # http://localhost:8081
 python3 ib_research_health.py
-python3 -m unittest test_ib_research_geo test_institution_intelligence
+python3 -m unittest discover -t . -s . -p 'test_*.py'
 ```
 
 定时任务见 `ib_research_cron_runner.py`（带锁、日志、异常告警）。每次采集成功且质量检查通过后，`publish_cloudflare.py` 会在后台导出并发布新的 Cloudflare 静态快照。
@@ -81,6 +100,19 @@ bash deploy.sh    # 同步代码 → 校验/单测 → 本机预览冒烟 → �
 python3 publish_cloudflare.py  # 仅重新导出并发布当前只读快照
 ```
 
+代码检出在其他位置时，通过 `IB_RESEARCH_SOURCE_DIR` 指定。先在本机生成可审阅快照，确认事件页和来源，再发布：
+
+```bash
+cd /path/to/ib-research
+IB_RESEARCH_CACHE_DIR="$HOME/.openclaw/workspace/data/ib_research" \
+IB_RESEARCH_ENV="$HOME/.openclaw/workspace/.env" \
+  python3 export_static_site.py
+# 上一行只导出本地 cloudflare_dist，不发布 Cloudflare。
+
+# 准备发布时运行；源码测试在复制前执行，冒烟失败即停止发布。
+IB_RESEARCH_SOURCE_DIR="$PWD" bash deploy.sh
+```
+
 公网 `https://fresearch.cc.cd/*` 由 Worker route 直接命中静态资产；`127.0.0.1:8081` 仅保留为本机预览和手动刷新入口。Cloudflare 部署是不可变版本，发布失败时线上继续提供上一版内容。
 
 ## 代码结构
@@ -90,6 +122,8 @@ python3 publish_cloudflare.py  # 仅重新导出并发布当前只读快照
 | `ib_research_fetcher.py` | 抓取 + LLM 摘要，产出 `report.json` |
 | `ib_research_server.py` | Flask 服务与首页；首屏一页评级行 + JSON 岛 |
 | `ib_research_geo.py` | GEO 子页、sitemap、robots、JSON-LD、llms.txt |
+| `ib_research_sources.py` | 公开字段投影、来源分级、稳定事件 ID 与持久档案 |
+| `ib_research_source_pages.py` | 只读事件目录、详情、RSS 与公开事件 JSON |
 | `design_system.py` | 主题 token、基础样式、公共组件 CSS |
 | `institution_intelligence.py` | 按机构聚合方向一致率与按方向计的超额收益 |
 | `collectors/yahoo_provider.py` | Yahoo 评级回填 |
@@ -115,6 +149,7 @@ python3 publish_cloudflare.py  # 仅重新导出并发布当前只读快照
 | `IB_RESEARCH_REFRESH_TOKEN` | 保护 `/refresh` 端点（可选） |
 | `IB_RESEARCH_CACHE_DIR` | 数据目录（默认 `./data/ib_research`） |
 | `IB_RESEARCH_PUBLIC_ORIGIN` | 对外 canonical 域名（默认 `https://fresearch.cc.cd`） |
+| `IB_RESEARCH_SOURCE_DIR` / `IB_RESEARCH_DEPLOY_DIR` / `IB_RESEARCH_PYTHON` | `deploy.sh` 的代码目录、运行目录与 Python 路径覆盖 |
 | `HTTPS_PROXY` | 境外源走本地代理（例 `http://127.0.0.1:1082`） |
 
 ## 数据来源说明

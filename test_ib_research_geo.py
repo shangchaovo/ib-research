@@ -2,6 +2,9 @@
 """SEO/GEO 公开页与爬虫入口的回归测试。"""
 import base64
 import json
+from pathlib import Path
+import re
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -164,7 +167,9 @@ class GeoPagesTest(unittest.TestCase):
         self.assertIn("本页要点", html)
         self.assertIn("机构观点整合", html)
         self.assertIn("观点发布后的市场反应", html)
-        self.assertIn("已验证来源", html)
+        self.assertIn("公开新闻标题规则抽取", html)
+        self.assertNotIn("已验证来源", html)
+        self.assertRegex(html, r'href="/events/[a-f0-9]{24}/"')
         self.assertIn("application/ld+json", html)
         self.assertIn('rel="canonical" href="https://fresearch.cc.cd/stocks/nvda/"', html)
         self.assertIn("/methodology/", html)
@@ -340,7 +345,8 @@ class GeoPagesTest(unittest.TestCase):
         ]
         html = _generate_html(report)
         self.assertNotIn("待补来源", html)
-        self.assertIn("evidence-verified", html)
+        self.assertIn("Yahoo 结构化记录", html)
+        self.assertIn("未保存单条原文链接", html)
         # 原/新评级合并成一列后，独立的箭头列不再存在。
         self.assertNotIn('<td class="arrow">', html)
         self.assertIn('class="rating-arrow"', html)
@@ -374,6 +380,79 @@ class GeoPagesTest(unittest.TestCase):
         self.assertLessEqual(len(LEARN_PAGES), 12)
         xml = sitemap_xml(_empty_report())
         self.assertLess(xml.count("<url>"), 80)
+
+    def test_thin_stock_page_is_noindex_in_html_and_headers(self):
+        response = self.client.get("/stocks/amd/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('name="robots" content="noindex,follow"', response.get_data(as_text=True))
+        self.assertEqual(response.headers["X-Robots-Tag"], "noindex, follow")
+
+    def test_collection_dates_do_not_claim_a_fabricated_publication_day(self):
+        for path in ("/stocks/nvda/", "/institutions/morgan-stanley/", "/reactions/"):
+            html = self.client.get(path).get_data(as_text=True)
+            schemas = re.findall(r'<script type="application/ld\+json">(.*?)</script>', html, re.S)
+            self.assertTrue(schemas)
+            for payload in schemas:
+                self.assertNotIn("datePublished", json.loads(payload))
+        self.assertNotIn("<lastmod>2026-08-30</lastmod>", sitemap_xml(_empty_report()))
+
+    def test_inference_labels_and_event_dates_are_not_promoted_to_verified(self):
+        from ib_research_geo import _changes_table
+        from ib_research_server import _rating_row_html
+
+        event = dict(_empty_report()["summary"]["Rating_Changes"][0])
+        event.update({"_Source": "llm_inferred", "_Time_Inferred": True})
+        for html in (_changes_table([event]), _rating_row_html({"detail": event})):
+            self.assertIn("模型整理或推断", html)
+            self.assertNotIn(">已验证<", html)
+        self.assertIn("日期待核对", _changes_table([event]))
+
+    def test_raw_api_requires_trusted_local_owner(self):
+        for kwargs in (
+            {"base_url": "https://fresearch.cc.cd"},
+            {"headers": {"CF-Connecting-IP": "203.0.113.20"}},
+            {"environ_base": {"REMOTE_ADDR": "203.0.113.20"}},
+        ):
+            response = self.client.get("/api/ib-research/raw", **kwargs)
+            self.assertEqual(response.status_code, 403)
+            self.assertNotIn("raw", response.get_json().get("data", {}))
+        self.assertEqual(self.client.get("/api/ib-research/raw").status_code, 200)
+
+    def test_public_api_uses_snapshot_and_omits_internal_payloads(self):
+        report = _empty_report()
+        report["raw"]["private_debug"] = "RAW_INTERNAL_SENTINEL"
+        report["meta"]["run_id"] = "RUN_INTERNAL_SENTINEL"
+        report["summary"]["_analysis_error"] = "ERROR_INTERNAL_SENTINEL"
+        report["summary"]["Rating_Changes"][0]["_internal"] = "EVENT_INTERNAL_SENTINEL"
+        with patch.dict(app.config, {"PUBLICATION_REPORT": report}):
+            response = self.client.get("/api/ib-research")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()["data"]
+        self.assertNotIn("raw", payload)
+        self.assertEqual(payload["summary"]["Rating_Changes"][0]["Symbol"], "NVDA")
+        for marker in ("RAW_INTERNAL_SENTINEL", "RUN_INTERNAL_SENTINEL", "ERROR_INTERNAL_SENTINEL", "EVENT_INTERNAL_SENTINEL"):
+            self.assertNotIn(marker, response.get_data(as_text=True))
+
+    def test_archive_update_invalidates_homepage_without_a_new_report(self):
+        import ib_research_server as server
+        from ib_research_sources import sync_public_archive
+
+        report = _empty_report()
+        current = _empty_report()
+        current["summary"]["Rating_Changes"][0].pop("_Source_URL")
+        current["raw"]["news"] = []
+        with tempfile.TemporaryDirectory() as cache, \
+             patch("ib_research_server.CACHE_DIR", cache), \
+             patch("ib_research_geo.CACHE_DIR", cache), \
+             patch("ib_research_server.get_latest_report", return_value=current):
+            Path(cache, "report_2026-08-17.json").write_text(json.dumps(current), encoding="utf-8")
+            server._page_cache.clear()
+            first = self.client.get("/", headers={"CF-Connecting-IP": "203.0.113.12"})
+            self.assertNotRegex(first.get_data(as_text=True), r'href="/events/[a-f0-9]{24}/"')
+            sync_public_archive(report, cache, now="2026-11-23T00:00:00Z")
+            second = self.client.get("/", headers={"CF-Connecting-IP": "203.0.113.12"})
+            self.assertRegex(second.get_data(as_text=True), r'href="/events/[a-f0-9]{24}/"')
+            server._page_cache.clear()
 
 
 if __name__ == "__main__":

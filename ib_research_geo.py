@@ -9,15 +9,17 @@ from __future__ import annotations
 import json
 import os
 import re
+from datetime import date
 from html import escape
 from typing import Any, Optional
 from urllib.parse import quote
 from xml.sax.saxutils import escape as xml_escape
 
-from flask import Response, abort, redirect
+from flask import Response, abort, current_app, g, has_app_context, redirect
 
 from design_system import MOTION_HEAD_SCRIPT, MOTION_SCRIPT, PAGE_CSS
-from ib_research_fetcher import HOT_SYMBOLS, TARGET_BANKS, get_latest_report
+from ib_research_fetcher import CACHE_DIR, HOT_SYMBOLS, TARGET_BANKS, get_latest_report as _load_latest_report
+from ib_research_sources import event_id, get_public_events, safe_source_url, source_label
 from institution_intelligence import ACTION_LABELS, TRACKED_INSTITUTIONS, build_institution_intelligence
 
 SITE_NAME = "FResearch"
@@ -28,12 +30,33 @@ X_HANDLE = "@johny_xie"
 DEFAULT_ORIGIN = "https://fresearch.cc.cd"
 GOOGLE_SITE_VERIFICATION = "s8mvn7tXPvT_q4BHyD2tZAXPFuj3xdUSksDjR6BCj1g"
 
-# 手写知识页与主题页的首次发布日（内容变更时更新）。
-CONTENT_PUBLISHED = "2026-08-30"
-
-
 def public_origin() -> str:
     return os.getenv("IB_RESEARCH_PUBLIC_ORIGIN", DEFAULT_ORIGIN).rstrip("/")
+
+
+def get_latest_report() -> dict:
+    """静态导出的所有页面使用同一份报告；普通请求仍读取最新报告。"""
+    if has_app_context() and "PUBLICATION_REPORT" in current_app.config:
+        return current_app.config["PUBLICATION_REPORT"]
+    return _load_latest_report()
+
+
+def public_events_for_report(report: dict) -> list[dict]:
+    """只读公开档案；同一请求复用投影，不让每行/每个股票重复读盘。"""
+    if has_app_context():
+        if "PUBLICATION_EVENTS" in current_app.config:
+            return current_app.config["PUBLICATION_EVENTS"]
+        cached = getattr(g, "public_events_snapshot", None)
+        if cached is not None and cached[0] is report:
+            return cached[1]
+    events = get_public_events(report, CACHE_DIR)
+    if has_app_context():
+        g.public_events_snapshot = (report, events)
+    return events
+
+
+def _public_event_map(report: dict) -> dict[str, dict]:
+    return {item["id"]: item for item in public_events_for_report(report)}
 
 
 def _abs(path: str) -> str:
@@ -62,8 +85,11 @@ def _iso_date(value: str) -> str:
     raw = str(value or "").strip()
     match = re.search(r"\d{4}-\d{2}-\d{2}", raw)
     if match:
-        return match.group(0)
-    return CONTENT_PUBLISHED
+        try:
+            return date.fromisoformat(match.group(0)).isoformat()
+        except ValueError:
+            pass
+    return ""
 
 
 def _parse_summary(report: dict) -> dict:
@@ -760,6 +786,7 @@ def site_nav_html(current: str = "") -> str:
         ("/stocks/", "股票目标价"),
         ("/institutions/", "机构观点"),
         ("/reactions/", "市场验证"),
+        ("/events/", "事件档案"),
         ("/methodology/", "研究方法"),
     ]
     items = []
@@ -829,6 +856,8 @@ def site_footer_nav_html(include_disclaimer: bool = True) -> str:
         ("/stocks/", "股票目标价"),
         ("/institutions/", "机构观点"),
         ("/reactions/", "市场验证"),
+        ("/events/", "事件档案"),
+        ("/feed.xml", "RSS 订阅"),
         ("/topics/", "分析框架"),
         ("/methodology/", "研究方法"),
         ("/sources/", "数据来源"),
@@ -879,7 +908,7 @@ def seo_head(
     og_type = "article" if any(str(item.get("@type")) == "Article" for item in schemas) else "website"
     modified_tag = (
         f'<meta property="article:modified_time" content="{_safe_attr(_iso_date(date_modified))}" />'
-        if date_modified
+        if og_type == "article" and _iso_date(date_modified)
         else ""
     )
     return f"""
@@ -890,6 +919,7 @@ def seo_head(
 <meta name="google-site-verification" content="{GOOGLE_SITE_VERIFICATION}">
 <meta name="robots" content="{robots}">
 <link rel="canonical" href="{_safe_attr(canonical)}">
+<link rel="alternate" type="application/rss+xml" title="FResearch 公开事件档案" href="{_safe_attr(_abs('/feed.xml'))}">
 <link rel="icon" type="image/svg+xml" href="/favicon.svg?v=2">
 <link rel="apple-touch-icon" href="/apple-touch-icon.png?v=2">
 <meta property="og:type" content="{og_type}">
@@ -1007,25 +1037,27 @@ def webpage_schema(name: str, description: str, path: str, page_type: str = "Web
 
 
 def article_schema(headline: str, description: str, path: str, date_modified: str = "") -> dict:
-    date_value = _iso_date(date_modified or CONTENT_PUBLISHED)
-    return {
+    # 未逐页记录首次发布/修改时间的手写文章不猜日期。事件详情自己提供真实建档时间。
+    schema = {
         "@context": "https://schema.org",
         "@type": "Article",
         "headline": headline,
         "description": description,
         "url": _abs(path),
         "inLanguage": "zh-CN",
-        "datePublished": CONTENT_PUBLISHED,
-        "dateModified": date_value,
         "author": {"@type": "Organization", "name": SITE_NAME, "url": _abs("/about/")},
         "publisher": organization_schema(),
         "mainEntityOfPage": {"@type": "WebPage", "@id": _abs(path)},
         "image": _abs("/og-image.png"),
     }
+    date_value = _iso_date(date_modified)
+    if date_value:
+        schema["dateModified"] = date_value
+    return schema
 
 
 def _faq_schema(page: dict) -> Optional[dict]:
-    """把页面里的"疑问式"内容转成 FAQPage 结构化数据,提高被精选摘要/AI 引用概率。
+    """把页面里实际可见的问答转成 FAQPage 结构化数据。
 
     取 h1(知识页多为疑问句, 如"市盈率(PE)是什么?")配 one_liner 作为首条问答,
     再加上 sections 里以"？"结尾的小节。少于 2 条有效问答则不出 schema。
@@ -1048,7 +1080,7 @@ def _faq_schema(page: dict) -> Optional[dict]:
     for heading, text in page.get("sections", []):
         if str(heading).strip().endswith(("？", "?")):
             _add(heading, text)
-    # 单条问答的 FAQPage 不符合 Google 的富媒体条件，反而是低质结构化数据信号。
+    # 本站只对含多组问答的页面使用 FAQ 标记；不代表搜索展示或 AI 引用保证。
     if len(qa) < 2:
         return None
     return {"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": qa[:6]}
@@ -1128,10 +1160,16 @@ def extract_symbol_slice(report: dict, symbol: str) -> dict:
         for item in raw_news
         if isinstance(item, dict) and item.get("title") and item.get("url")
     }
+    public_by_id = _public_event_map(report)
     for change in changes:
         headline = str(change.get("_Headline") or "").strip()
         if headline and not change.get("_Source_URL"):
             change["_Source_URL"] = url_by_title.get(headline, "")
+        archived = public_by_id.get(event_id(change))
+        if archived:
+            change["_Public_Event_ID"] = archived["id"]
+            if not change.get("_Source_URL"):
+                change["_Source_URL"] = archived.get("source_url") or ""
     history = ((report.get("market_context") or {}).get("history") or {}) if isinstance(report, dict) else {}
     series = history.get(symbol) or []
     last_close = None
@@ -1367,11 +1405,16 @@ def _changes_table(changes: list[dict]) -> str:
     for item in changes:
         action = str(item.get("Action") or "")
         action_label = ACTION_LABELS.get(action, action.replace("_", " ") or "—")
-        source_url = str(item.get("_Source_URL") or "")
-        source_label = "已验证来源" if item.get("_Source") else "来源待补"
-        source_html = _safe_text(source_label)
-        if source_url.startswith("https://"):
+        source_url = safe_source_url(item.get("_Source_URL"))
+        source_html = _safe_text(source_label(item.get("_Source")))
+        if source_url:
             source_html = f'<a href="{_safe_attr(source_url)}" rel="noopener noreferrer">{source_html} ↗</a>'
+        record_id = str(item.get("_Public_Event_ID") or "")
+        if re.fullmatch(r"[a-f0-9]{24}", record_id):
+            source_html += f' <a href="/events/{record_id}/">记录详情</a>'
+        event_date = str(item.get("Time") or "")[:10]
+        if item.get("_Time_Inferred") or "inferred_event_date" in (item.get("_Quality_Flags") or []):
+            event_date += "（首次记录，日期待核对）"
         rows.append(
             "<tr>"
             f'<td>{_safe_text(item.get("Bank") or "—")}</td>'
@@ -1379,7 +1422,7 @@ def _changes_table(changes: list[dict]) -> str:
             f'<td>{_safe_text(item.get("Old_Rating") or "—")}</td>'
             f'<td>{_safe_text(item.get("New_Rating") or "—")}</td>'
             f'<td class="mono">{_safe_text(item.get("Price_Target") or "—")}</td>'
-            f'<td class="mono">{_safe_text(str(item.get("Time") or "")[:10])}</td>'
+            f'<td class="mono">{_safe_text(event_date)}</td>'
             f'<td>{source_html}</td>'
             "</tr>"
         )
@@ -1416,9 +1459,9 @@ def _target_panel(targets: list[dict]) -> str:
     consensus = item.get("_Consensus") or {}
     rows = [
         ("展示目标价", item.get("Target_Price") or "—"),
-        ("来源分级", item.get("_Source") or "—"),
-        ("已验证目标价", item.get("_Verified_PT") or "—"),
-        ("已验证机构", item.get("_Verified_Bank") or "—"),
+        ("来源分级", source_label(item.get("_Source"))),
+        ("来源记录目标价", item.get("_Verified_PT") or "—"),
+        ("关联机构", item.get("_Verified_Bank") or "—"),
     ]
     if consensus:
         rows.extend(
@@ -1441,7 +1484,7 @@ def _percent(value: Any, *, signed: bool = True) -> str:
     return f"{number:+.1%}" if signed else f"{number:.0%}"
 
 
-def _reaction_table(events: list[dict], include_institution: bool = True) -> str:
+def _reaction_table(events: list[dict], include_institution: bool = True, public_events: Optional[dict] = None) -> str:
     if not events:
         return '<p class="empty">暂无可对齐的关注池事件。</p>'
     rows = []
@@ -1451,10 +1494,19 @@ def _reaction_table(events: list[dict], include_institution: bool = True) -> str
         returns = reaction.get("returns", {}) or {}
         alignment = str(reaction.get("alignment") or "pending")
         reaction_class = f"reaction-{alignment}"
-        source_url = str(event.get("source_url") or "")
+        record = (public_events or {}).get(event_id({
+            "Bank": event.get("institution"), "Symbol": event.get("symbol"),
+            "Action": event.get("action"), "Time": event.get("date"),
+        }))
+        source_url = safe_source_url(event.get("source_url") or (record or {}).get("source_url"))
         action = _safe_text(event.get("action_label") or event.get("action") or "—")
-        if source_url.startswith("https://"):
+        if source_url:
             action = f'<a href="{_safe_attr(source_url)}" rel="noopener noreferrer">{action} ↗</a>'
+        if record:
+            action += f' <a href="/events/{_safe_attr(record["id"])}/">记录详情</a>'
+        event_date = str(event.get("date") or "")
+        if record and record.get("date_basis") == "first_seen":
+            event_date += "（首次发现）"
         institution_cell = (
             f'<td><a href="/institutions/{_safe_attr(event.get("institution_slug"))}/">'
             f'{_safe_text(event.get("institution"))}</a></td>'
@@ -1475,7 +1527,7 @@ def _reaction_table(events: list[dict], include_institution: bool = True) -> str
             + f'<td class="mono">{_safe_text(_percent(excess.get("5d")))}</td>'
             + f'<td class="mono">{_safe_text(_percent(excess.get("20d")))}</td>'
             + f'<td class="{reaction_class}">{_safe_text(reaction.get("alignment_label") or "等待验证")}</td>'
-            + f'<td class="mono muted">{_safe_text(event.get("date") or "")}</td>'
+            + f'<td class="mono muted">{_safe_text(event_date)}</td>'
             + "</tr>"
         )
     first_heading = "<th>机构</th>" if include_institution else ""
@@ -1675,7 +1727,7 @@ def render_stock_page(symbol: str, report: dict) -> str:
 </div>
 <div class="panel">
   <h2>观点发布后的市场反应</h2>
-  {_reaction_table(symbol_events)}
+  {_reaction_table(symbol_events, public_events=_public_event_map(report))}
   <div class="evidence-note">相对收益以 SPY 为基准，按事件日期做日线近似。市场未确认不代表机构存在未披露交易行为。</div>
 </div>
 <div class="panel">
@@ -1694,17 +1746,20 @@ def render_stock_page(symbol: str, report: dict) -> str:
     <li><a href="/sources/">数据来源</a>：Finnhub、Yahoo Finance、Google News RSS、Alpha Vantage 等公开接口</li>
     <li><a href="/methodology/">研究方法</a>：按 (银行, 代码, 动作, 日期) 去重，目标价分一致预期 / 标题验证 / 交叉验证推断</li>
     <li><a href="/ai-methodology/">AI 使用方法</a>：LLM 只做归纳，不把未验证数字当事实</li>
-    <li>Data as of: {_safe_text(generated[:19] or CONTENT_PUBLISHED)}</li>
+    <li>报告生成时间：{_safe_text(generated[:19] or '尚未记录')}；不等同于机构事件发生时间。</li>
   </ul>
 </div>
 """
     schemas = [
-        article_schema(title, description, path, generated),
-        webpage_schema(title, description, path),
+        webpage_schema(title, description, path, "CollectionPage"),
         crumb_schema,
         organization_schema(),
     ]
-    return render_page(title, description, path, body, schemas, "/stocks/", generated)
+    indexable = bool(slice_data["changes"] or slice_data["targets"] or slice_data["news"])
+    return render_page(
+        title, description, path, body, schemas, "/stocks/", generated,
+        robots_directive="index,follow,max-image-preview:large,max-snippet:-1" if indexable else "noindex,follow",
+    )
 
 
 def render_topics_index() -> str:
@@ -1918,7 +1973,7 @@ def render_compare_page(slug: str, report: dict) -> str:
   {_stock_chips([left, right])}
 </div>
 """
-    schemas = [article_schema(title, description, path, generated), crumb_schema]
+    schemas = [webpage_schema(title, description, path, "CollectionPage"), crumb_schema]
     return render_page(
         title,
         description,
@@ -1958,7 +2013,7 @@ def render_institutions_index(report: dict) -> str:
 {_institution_cards(institutions)}
 <div class="panel">
   <h2>最近公开动作与价格反应</h2>
-  {_reaction_table(intelligence.get('events', []) or [])}
+  {_reaction_table(intelligence.get('events', []) or [], public_events=_public_event_map(report))}
 </div>
 <div class="evidence-note">本页只聚合当前关注股票池内、机构和日期可识别的公开卖方动作。方向一致率样本不足时不做机构排名；同一股票同日多机构动作属于混杂样本。</div>
 """
@@ -2019,11 +2074,11 @@ def render_institution_page(slug: str, report: dict) -> str:
 {metrics}
 <div class="panel">
   <h2>评级、目标价与市场验证</h2>
-  {_reaction_table(events, include_institution=False)}
+  {_reaction_table(events, include_institution=False, public_events=_public_event_map(report))}
 </div>
 <div class="evidence-note">卖方研究、交易、投行与资产管理部门可能相互独立。本页分析的是公开表态及其后市场反应，不是对{name}持仓、出货、抄底或主观意图的认定。</div>
 """
-    schemas = [article_schema(title, description, path, generated), crumb_schema, organization_schema()]
+    schemas = [webpage_schema(title, description, path, "CollectionPage"), crumb_schema, organization_schema()]
     return render_page(title, description, path, body, schemas, "/institutions/", generated)
 
 
@@ -2051,7 +2106,7 @@ def render_reactions_page(report: dict) -> str:
   <div class="metric"><b>{neutral} / {pending}</b><span>中性动作 / 等待窗口</span></div>
   <div class="metric"><b>SPY</b><span>相对收益基准</span></div>
 </div>
-<div class="panel">{_reaction_table(events)}</div>
+<div class="panel">{_reaction_table(events, public_events=_public_event_map(report))}</div>
 <div class="panel">
   <h2>计算口径</h2>
   <ul class="source-list">
@@ -2064,7 +2119,7 @@ def render_reactions_page(report: dict) -> str:
 </div>
 <div class="evidence-note">市场未确认只说明随后价格没有配合公开观点，不能证明机构在出货、抄底或操纵市场。</div>
 """
-    schemas = [article_schema(title, description, path, generated), crumb_schema, organization_schema()]
+    schemas = [webpage_schema(title, description, path, "CollectionPage"), crumb_schema, organization_schema()]
     return render_page(title, description, path, body, schemas, path, generated)
 
 
@@ -2141,7 +2196,7 @@ def _trust_body(slug: str) -> tuple[str, str, str, str]:
             "FResearch 使用的公开数据源清单，以及明确不接入的来源。",
             "数据来源",
             """
-<p class="one-liner">只使用能稳定返回、且允许被引用为公开信息的来源。</p>
+<p class="one-liner">整理公开可访问的数据、新闻标题和摘要，并说明每条记录能追溯到哪里。</p>
 <div class="panel">
   <h2>当前接入</h2>
   <ul class="source-list">
@@ -2153,8 +2208,14 @@ def _trust_body(slug: str) -> tuple[str, str, str, str]:
   </ul>
   <h2>明确不接入</h2>
   <p>Barron's（实测 401）、Seeking Alpha PerimeterX（403）、TipRanks（403）等免费方案不可用的源不会 silently 重试后伪装成数据。</p>
-  <h2>引用时请带日期</h2>
-  <p>任何目标价都是某个交易日的快照。请使用页面上的 Generated At / Data as of。</p>
+  <h2>逐条追溯与引用</h2>
+  <p><a href="/events/">公开事件档案</a>为具有标题、原文链接与可解释来源类型的事件提供独立记录页。优先引用记录页的永久链接，同时保留报道出处。报道链接不一定是投行的原始公告或完整研报。</p>
+  <p>“标题规则抽取”和“摘要规则抽取”表示字段的提取方式，不代表机构已经审核本站内容。Yahoo 结构化记录、韩语聚合线索和未标明来源的模型整理不会仅凭来源标签进入永久事件档案。</p>
+  <h2>区分三个时间</h2>
+  <p>事件记录日期只有日级精度，可能是新闻日期或首次发现日；页面会说明日期口径。首次建档时间表示本站何时开始保存该永久记录。实质更新时间只随公开字段或证据变化更新。报告生成时间不代表任何机构刚刚发布了观点。</p>
+  <h2>字段补全与使用边界</h2>
+  <p>历史评级回填、目标价补全、沿用历史评级等标记随记录公开。补全字段不能自动视为由当前一篇报道全部证实。本站提供归集记录与来源入口，不转授上游文章、数据或研报的使用权。</p>
+  <p>机器读取入口：<a href="/feed.xml">RSS</a>、<a href="/data/events.json">公开事件 JSON</a>。两者与 HTML 详情共用公开字段口径，不包含原始采集载荷。</p>
 </div>
 """,
         ),
@@ -2166,11 +2227,11 @@ def _trust_body(slug: str) -> tuple[str, str, str, str]:
 <p class="one-liner">只有具有研究对象、来源和更新时间的页面才进入索引。</p>
 <div class="panel">
   <h2>可以索引</h2>
-  <p>关注池股票页、手写主题/知识页、研究方法与来源页、以及首页最新研报摘要。</p>
+  <p>有实质数据的关注池股票页、公开事件档案、手写分析框架、研究方法与来源页，以及首页最新研报摘要。</p>
   <h2>不会索引</h2>
-  <p>任意用户随口一问的生成结果、未通过质量阈值的程序化页面、API JSON、以及未验证的模型数字。</p>
+  <p>任意用户随口一问的生成结果、没有实质数据的股票页、未通过公开档案准入的模型整理，以及内部 API。公开事件 JSON 是可抓取的数据下载入口，引用时应回到对应 HTML 记录页。</p>
   <h2>更正</h2>
-  <p>若发现目标价或评级展示错误，可通过 {email} 报告。页面以最新成功采集为准，并保留生成时间。</p>
+  <p>若发现目标价或评级展示错误，可通过 {email} 报告，并附事件记录链接与对应原文。事件页保留首次建档和实质更新时间；补全同一事件的来源、评级或目标价不会改变链接。机构、动作或日期等身份字段变更需要单独核对，不能靠相似标题自动合并。</p>
 </div>
 """.format(email=CONTACT_EMAIL),
         ),
@@ -2317,8 +2378,9 @@ def _has_indexable_substance(report: dict, symbol: str) -> bool:
 
 def sitemap_xml(report: Optional[dict] = None) -> str:
     report = report if report is not None else get_latest_report()
-    dynamic_lastmod = _iso_date(_report_generated_at(report) or CONTENT_PUBLISHED)
-    static_lastmod = CONTENT_PUBLISHED
+    # 报告生成时间不是每页实质修改时间；没有逐页证据就省略 lastmod。
+    dynamic_lastmod = ""
+    static_lastmod = ""
     urls: list[tuple[str, str]] = [
         ("/", dynamic_lastmod),
         ("/stocks/", dynamic_lastmod),
@@ -2346,6 +2408,9 @@ def sitemap_xml(report: Optional[dict] = None) -> str:
         slug = str(item.get("slug") or "") if isinstance(item, dict) else ""
         if slug in TRACKED_INSTITUTIONS:
             urls.append((f"/institutions/{slug}/", dynamic_lastmod))
+    # 延迟导入避免 source_pages 使用本模块渲染组件时产生循环依赖。
+    from ib_research_source_pages import source_sitemap_entries
+    urls.extend(source_sitemap_entries(public_events_for_report(report)))
 
     chunks = [
         '<?xml version="1.0" encoding="UTF-8"?>',
@@ -2353,12 +2418,8 @@ def sitemap_xml(report: Optional[dict] = None) -> str:
     ]
     for path, lastmod in urls:
         loc = xml_escape(_abs(path))
-        chunks.append(
-            "<url>"
-            f"<loc>{loc}</loc>"
-            f"<lastmod>{lastmod}</lastmod>"
-            "</url>"
-        )
+        date_tag = f"<lastmod>{xml_escape(lastmod)}</lastmod>" if lastmod else ""
+        chunks.append(f"<url><loc>{loc}</loc>{date_tag}</url>")
     chunks.append("</urlset>")
     return "\n".join(chunks) + "\n"
 
@@ -2380,7 +2441,10 @@ The canonical site is {origin}/. Public pages are server-rendered HTML.
 - Product: sell-side price-target tracker + institution-view aggregation + post-call market reaction
 - Users: investors and researchers tracking investment-bank targets, public research views and post-call market confirmation
 - Data: public sources (Finnhub, Yahoo Finance, Google News RSS, Alpha Vantage), deduped into a 30-day ledger
+- Archive: qualifying headline/summary extraction records with an external source title and URL have permanent event pages; archived records remain after the rolling ledger expires
 - AI: used for structured summaries only; unverified model numbers are not treated as facts
+- Evidence: extraction labels describe how fields were obtained, not a guarantee that the bank has verified the record. Preserve date-basis and field-backfill notes when citing
+- Dates: distinguish the recorded event date, first archive creation and substantive content modification; a report refresh is not a new event
 - Boundary: public calls and later prices cannot prove an institution's holdings or trading intent
 - Language: Simplified Chinese UI, English tickers
 
@@ -2400,6 +2464,9 @@ The canonical site is {origin}/. Public pages are server-rendered HTML.
 - [Stock index]({origin}/stocks/)
 - [Institution views]({origin}/institutions/)
 - [Market reactions]({origin}/reactions/)
+- [Permanent event archive]({origin}/events/)
+- [Public event RSS]({origin}/feed.xml)
+- [Public event JSON]({origin}/data/events.json)
 
 ## Research lenses
 - [Price targets and rating actions]({origin}/topics/price-targets/)
@@ -2454,7 +2521,11 @@ def register_geo_routes(app) -> None:
 
     @app.route("/stocks/<symbol>/")
     def stock_page(symbol: str):
-        return _html_response(render_stock_page(symbol, get_latest_report()))
+        report = get_latest_report()
+        return _html_response(
+            render_stock_page(symbol, report),
+            indexable=_has_indexable_substance(report, symbol.upper()),
+        )
 
     @app.route("/topics/")
     def topics_index():

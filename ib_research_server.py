@@ -5,8 +5,8 @@
 公网访问经 Cloudflare 隧道 fresearch-dashboard 转发到本机，不直接监听公网网卡。
 
 端点:
-  GET /api/ib-research       -> JSON格式的研报总结
-  GET /api/ib-research/raw   -> 原始数据
+  GET /api/ib-research       -> 字段白名单内的公开研报总结
+  GET /api/ib-research/raw   -> 仅本机机主可读的原始数据
   POST /api/ib-research/refresh -> 手动刷新（需 X-Refresh-Token，见 .env）
   GET /                        -> HTML报告页面
 """
@@ -35,11 +35,14 @@ from flask import Flask, jsonify, Response, request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from design_system import MOTION_SCRIPT, PAGE_CSS
 from ib_research_fetcher import run_fetch, get_latest_report, CACHE_DIR, FINNHUB_TOKEN, HOT_SYMBOLS
+from ib_research_sources import ARCHIVE_FILENAME, event_id, public_report, safe_source_url, source_label
+from ib_research_source_pages import register_source_routes
 from institution_intelligence import build_institution_intelligence
 from ib_research_geo import (
     homepage_footer_nav_html,
     homepage_head_html,
     homepage_nav_html,
+    public_events_for_report,
     register_geo_routes,
 )
 
@@ -113,7 +116,7 @@ def _rate_limited(scope: str, limit: int, window: int = 60) -> bool:
 
 
 def _report_cache_key() -> tuple:
-    """以数据目录内最新报告文件的 (文件名, mtime) 为键；fetcher 写新报告即失效。"""
+    """报告或独立公开档案更新时失效，补来源后首页也能出现永久链接。"""
     latest_name = None
     latest_mtime = 0.0
     try:
@@ -129,11 +132,18 @@ def _report_cache_key() -> tuple:
                 latest_name = name
     except OSError:
         pass
-    return (latest_name, latest_mtime)
+    try:
+        archive_stat = os.stat(os.path.join(CACHE_DIR, ARCHIVE_FILENAME))
+        archive_key = (archive_stat.st_mtime_ns, archive_stat.st_size)
+    except OSError:
+        archive_key = None
+    return (latest_name, latest_mtime, archive_key)
 
 
 def _get_report_cached() -> dict:
     """按 mtime 键缓存 get_latest_report()，避免每请求重读+重解析 ~800KB JSON。"""
+    if "PUBLICATION_REPORT" in app.config:
+        return app.config["PUBLICATION_REPORT"]
     key = _report_cache_key()
     with _page_cache_lock:
         if _page_cache.get("key") == key and _page_cache.get("report") is not None:
@@ -150,6 +160,9 @@ def _get_report_cached() -> dict:
 
 def _get_html_cached(can_refresh: bool) -> tuple:
     """机主版/公开版 HTML 分开缓存；命中时不再重复渲染 1.4MB 页面。"""
+    if "PUBLICATION_REPORT" in app.config:
+        report = app.config["PUBLICATION_REPORT"]
+        return _generate_html(report, can_refresh=False), report
     key = _report_cache_key()
     # 令牌指纹并入缓存键：轮换令牌后机主版立即失效，不残留旧令牌
     token_fp = hashlib.sha256(
@@ -621,7 +634,7 @@ def _get_logo_svg(symbol: str) -> tuple[bytes, str, str]:
         body, mimetype = cached
         return _logo_svg_document(body, mimetype), "image/svg+xml", "cache"
     # 白名单闸口：报告里没出现过的 symbol 绝不回源（防公网刷接口耗 Finnhub 配额）
-    if normalized in _allowed_logo_symbols():
+    if not app.config.get("PUBLICATION_DISABLE_LOGO_FETCH") and normalized in _allowed_logo_symbols():
         _queue_logo_fetch(normalized)
     return _fallback_logo_svg(normalized), "image/svg+xml", "fallback"
 
@@ -815,6 +828,7 @@ def _build_rating_ledger(report: dict) -> list[dict]:
         if isinstance(item, dict) and item.get("title") and item.get("url")
     }
 
+    public_by_id = {item["id"]: item for item in public_events_for_report(report)}
     change_analysis = report.get("change_analysis", {}) or {}
     analyzed_changes = list(change_analysis.get("changes", []) or [])
     if not isinstance(summary, dict):
@@ -833,6 +847,11 @@ def _build_rating_ledger(report: dict) -> list[dict]:
             headline = str(detail.get("_Headline") or "").strip()
             if headline and not detail.get("_Source_URL"):
                 detail["_Source_URL"] = source_url_by_headline.get(headline, "")
+            archived = public_by_id.get(event_id(detail))
+            if archived:
+                detail["_Public_Event_ID"] = archived["id"]
+                if not detail.get("_Source_URL"):
+                    detail["_Source_URL"] = archived.get("source_url") or ""
             ledger.append({
                 "type": "new_rating",
                 "priority": priority_by_key.get(_rating_event_key(event), "normal"),
@@ -865,24 +884,31 @@ def _rating_row_html(change: dict) -> str:
     price_target = str(d.get("Price_Target") or "—")
     raw_time = str(d.get("Time") or "")
     event_date = _rating_date(raw_time) or _rating_date(d.get("_First_Seen"))
-    display_time = f"{event_date}*" if d.get("_Time_Inferred") else (event_date or raw_time)
+    time_inferred = d.get("_Time_Inferred") or "inferred_event_date" in (d.get("_Quality_Flags") or [])
+    display_time = f"{event_date}*" if time_inferred else (event_date or raw_time)
     source = str(d.get("_Source") or "")
     headline = str(d.get("_Headline") or "")
-    source_url = str(d.get("_Source_URL") or "")
+    source_url = safe_source_url(d.get("_Source_URL"))
 
     # 证据列只标注可回溯的来源。占全部事件八成以上的“待补来源”留空，
     # 避免整列变成对访客毫无信息量的免责声明。
     evidence_html = ""
-    if source in {"verified_headline", "verified_summary", "yahoo_structured", "kr_headline"}:
-        evidence_html = '<span class="evidence evidence-verified">已验证</span>'
+    if source:
+        evidence_html = (
+            f'<span class="evidence evidence-public" title="{_safe_attr(source_label(source))}">'
+            f'{_safe_text(source_label(source))}</span>'
+        )
     elif headline:
         evidence_html = '<span class="evidence evidence-public">公开标题</span>'
-    if evidence_html and source_url.startswith("https://"):
+    if evidence_html and source_url:
         evidence_html = (
             f'<a class="evidence-link" href="{_safe_attr(source_url)}" target="_blank" '
             f'rel="noopener noreferrer" title="{_safe_attr(headline or source_url)}">'
             f'{evidence_html}<span class="evidence-arrow">↗</span></a>'
         )
+    record_id = str(d.get("_Public_Event_ID") or "")
+    if re.fullmatch(r"[a-f0-9]{24}", record_id):
+        evidence_html += f' <a class="evidence-link" href="/events/{record_id}/">记录详情</a>'
 
     if old_rating or new_rating:
         rating_cell = (
@@ -1189,7 +1215,7 @@ def _generate_html(report: dict, can_refresh: bool = False) -> str:
         if source == "av_consensus":
             source_badge = '<span class="source-badge source-consensus">AV 共识</span>'
         elif source == "verified_headline":
-            source_badge = '<span class="source-badge source-verified">已验证</span>'
+            source_badge = '<span class="source-badge source-verified">公开标题</span>'
 
         # 评级分布条形（AV 共识）
         distribution_html = ""
@@ -3754,7 +3780,7 @@ def api_ib_research():
         report = _get_report_cached()
         return jsonify({
             "status": "ok",
-            "data": report,
+            "data": public_report(report),
         })
     except Exception as e:
         print(f"[api_ib_research] {e!r}", file=sys.stderr)
@@ -3763,7 +3789,9 @@ def api_ib_research():
 
 @app.route("/api/ib-research/raw")
 def api_ib_research_raw():
-    """JSON API: 返回原始数据"""
+    """原始采集载荷只供可信本机预览，不进入公网静态资产。"""
+    if not _is_owner_request():
+        return jsonify({"status": "forbidden", "message": "原始数据仅限本机访问"}), 403
     if _rate_limited("api", 30):
         return jsonify({"status": "error", "message": "请求过于频繁"}), 429
     try:
@@ -3862,6 +3890,7 @@ def index():
 
 
 register_geo_routes(app)
+register_source_routes(app)
 
 
 if __name__ == "__main__":
