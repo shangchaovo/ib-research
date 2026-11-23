@@ -4387,6 +4387,16 @@ def run_fetch(force: bool = False, fast: bool = False) -> Dict[str, Any]:
     os.replace(temp_cache_path, cache_path)
     print(f"  -> 报告已保存: {cache_path}")
 
+    # Public permalinks outlive the 30-day working ledger.  Archive only the
+    # whitelisted attributable projection after a complete report is on disk;
+    # an archive failure must neither destroy the old archive nor fail collection.
+    try:
+        from ib_research_sources import sync_public_archive
+        public_events = sync_public_archive(report, CACHE_DIR)
+        print(f"  -> 公开事件档案: {len(public_events)} 条")
+    except Exception as exc:
+        print(f"  [WARN] 公开事件档案更新失败（保留旧档案）: {type(exc).__name__}: {exc}")
+
     _state_mark_seen(state, [n.get("url", "") for n in news])
     _state_mark_news_seen(state, news)
     state["last_hash"] = data_hash
