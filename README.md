@@ -1,128 +1,65 @@
-# FResearch
+# FResearch · 投行评级与目标价追踪
 
-看外资怎么给关注的股票定价。UBS、Citi、摩根士丹利、JPMorgan 这些机构的评级变动、目标价和公开标题会收进来，按股票和机构归在一起；发完之后 1 天、5 天、20 个交易日相对 SPY 走没走，也会记一笔。
+同一只美股，有的机构上调目标价，有的维持原评级。打开 [NVDA 股票页](https://fresearch.cc.cd/stocks/nvda/)，先分清最新收盘价、一致目标价和各家公开报价的区间，再沿时间线查到哪家机构在何时改了什么。要看股价随后有没有跑赢大盘，到 [市场验证](https://fresearch.cc.cd/reactions/) 查它相对 SPY 的表现。
 
-**站点：[fresearch.cc.cd](https://fresearch.cc.cd/)**
+[近 30 天评级台账](https://fresearch.cc.cd/) · [按机构查观点](https://fresearch.cc.cd/institutions/) · [研究方法](https://fresearch.cc.cd/methodology/) · [数据来源](https://fresearch.cc.cd/sources/)
 
-本来是给自己看算力、HBM、设备这几条线用的。NVDA、TSM、ASML 这类票，评级和目标价散落在 Finnhub、Yahoo、各家新闻 RSS 里，每天翻一遍很烦。这个站把 upgrade / downgrade / 调目标价收到一张 30 天台账里，再让 LLM 归纳公开标题（Kimi 为主，Qwen 兜底）。数字必须有公开交叉证据才进目标价卡片，模型自己抽出来的不会单独当事实。
+## 从公开观点到市场反应
 
-采集大约四小时一轮，行情验证每天补。韩股那边会跟一下海力士、三星的本土券商目标价。首页默认看关注池近 30 天；点进股票页能看到现价对一致目标价、公开目标价区间和机构时间线。
+| 读者的问题 | 页面怎样回答 | 解读时要留意 |
+| --- | --- | --- |
+| 是升评级，还是只调了目标价？ | 台账归并 Finnhub、Yahoo Finance、Google News RSS 等公开来源，按机构、股票、动作和日期去重。Yahoo 的新旧评级和可追溯标题、摘要可补全缺项。 | 覆盖限于公开评级、标题和摘要，无法还原付费研报全文。首页默认展示关注池近 30 天，首屏 30 行，筛选和翻页可看其余事件。 |
+| 一致预期和单家机构的报价差多少？ | 股票页优先列 Alpha Vantage 一致目标价，并展示有公开出处的机构目标价。有至少三条报价时，绘制区间前按中位数的 1/3 至 3 倍过滤异常值。 | Alpha Vantage 数值缺失时，当前实现可能在「一致目标价」位置回用单家已核实的报价，解读前请核对来源。Kimi、Qwen 等模型参与观点归纳，仅由模型提取的数字不能单独进入目标价卡片。 |
+| 发布后跑赢了 SPY 吗？ | 取事件日前最近一个交易日的复权收盘为起点，计算自事件日起第 1、5、20 个交易日的收益。相对收益为 `(1 + 个股收益) / (1 + SPY 收益) − 1`。 | 按日期对齐，盘前盘后可能落在同一窗口。同股同日多家发声会标记混杂，尚未走完的窗口留空。 |
+| 哪家机构的公开判断与价格同向？ | 机构页列覆盖标的、样本量、方向一致率，以及按看多或看空方向调整的 5 日超额收益中位数。 | 同向是事后观察，小样本尤其容易波动。这些数据无法推断机构的真实持仓、交易意图或评级对价格的因果影响。 |
 
-> `git push` 只更新 GitHub。公网站点由 Cloudflare Workers Static Assets 提供；本机负责采集并自动发布只读快照。代码上线请跑 `bash deploy.sh`。
+关注池由 [采集器中的 `HOT_SYMBOLS`](ib_research_fetcher.py) 统一定义，覆盖 AI 算力、存储/HBM、半导体设备、网络和云平台等 30 只美股。另有韩文新闻源跟踪 SK 海力士、三星的本土券商目标价，原始单位为万韩元，美元换算仅作参考。[分析框架](https://fresearch.cc.cd/topics/) · [利益披露](https://fresearch.cc.cd/disclosures/)
 
-## 功能
+## 在本机生成一份报告
 
-- **评级变动追踪**：Finnhub / Yahoo Finance / Google News RSS / Benzinga / Zacks / StreetInsider 等来源的 upgrade / downgrade / 目标价调整，按 `(bank, symbol, action, date)` 去重，写入 30 天滚动台账
-- **韩股覆盖**：Google News 韩语 RSS 追踪 SK 海力士 / 三星的本土券商目标价（万韩元换算美元参考）
-- **研报观点整合**：公开标题、摘要与结构化评级事件按股票和机构归并，标出共识、分歧与仍待验证的风险；不声称持有未公开的完整研报
-- **证据优先的目标价**：优先 Alpha Vantage 一致预期、结构化评级和可回溯公开标题；LLM 抽出的数字没有外部交叉证据时不进目标价卡片。各家公开目标价按中位数启发式剔除异常值后再画区间
-- **市场反应验证**：复权收盘价计算观点发布后 1 / 5 / 20 个交易日回报，以相对 SPY 的几何超额收益判断公开倾向有没有被随后价格确认
-- **机构倾向蒸馏**：按机构汇总看多 / 看空、样本量、方向一致率，以及**按看多/看空方向计**的 5 日相对 SPY 超额收益；结论写进真实数字，不用全站共用的模板句
-- **LLM 摘要**：Kimi（`kimi-code`，JSON mode）生成结构化核心观点，Qwen（阿里云百炼）自动兜底
-- **评级回填**：Yahoo `from_grade → to_grade` 回填缺失的旧/新评级与目标价；摘要正则从新闻正文补提取模糊标题里的目标价
+在仓库根目录运行下面的命令。采集器使用 POSIX 文件锁，适合 macOS、Linux 或 WSL。仓库 CI 使用 Python 3.13。先建虚拟环境，复制配置样例，再在 `.env` 填写要使用的数据源凭据。
 
-## 页面与性能
-
-| 入口 | 内容 |
-| --- | --- |
-| `/` | 本期观点整合 + 评级台账。默认看关注池近 30 天；首屏只渲染当前一页（30 行），全量事件放进 JSON 岛，第一次筛选/翻页才解析 |
-| `/stocks/<ticker>/` | 现价 vs 一致目标价、公开目标价区间、机构观点时间线 |
-| `/institutions/`、`/institutions/<slug>/` | 各机构公开倾向、覆盖标的、同向率与市场确认样本 |
-| `/reactions/` | 逐事件 1 / 5 / 20 日绝对与相对回报 |
-| `/topics/` | 目标价、机构观点、市场验证、信号一致性的分析框架 |
-| `/about/` `/methodology/` `/sources/` `/disclosures/` | 品牌、方法、来源与 YMYL 披露 |
-
-首页与子页共用 `design_system.py` 的主题 token 和组件样式（暗色 / 明亮 / 护眼）。旧 `/learn/*`、`/compare/*` 永久重定向到研究方法、目标价框架或对应股票页。
-
-## SEO / GEO
-
-按「能抓取 → 能索引 → 能引用」接，不依赖单独的 GEO 黑科技。Google 对 AI Overviews 的指导仍是先把传统 SEO 做好。
-
-| 入口 | 作用 |
-| --- | --- |
-| `/robots.txt` | 允许 Googlebot / Bingbot / OAI-SearchBot；禁止 `/api/`；`GPTBot` / `CCBot` 默认 Disallow |
-| `/sitemap.xml` | 首页、有实质内容的关注池股票页、已有数据的机构页、市场验证、分析框架与信任页。**没有评级/目标价/新闻的薄股票页不进 sitemap** |
-| `/llms.txt` | 给生成式系统看的站点说明书；**不是** Google AI Overviews 的前置条件 |
-| JSON-LD | 首页 `CollectionPage`；股票/机构/反应页 `Article`；`SoftwareApplication` 只挂在 `/about/`（首页挂应用类型属于错配） |
-| 社交卡片 | `og:*` + `twitter:site` / `creator` / `image:alt`；分享图 `/og-image.png` |
-
-FAQ 结构化数据至少两组问答才输出。`mainEntityOfPage` 使用 `WebPage` 对象而不是裸 URL。
-
-收录检查：`python3 ib_research_seo_monitor.py` 抓公网域名核对验证 meta、robots、sitemap 和关键页面未回归。
-
-## 关注池
-
-AI 算力 + 存储/HBM + 半导体设备 + 网络主线 30 只：
-
-`NVDA AMD AVGO MRVL INTC TSM ARM` / `MU WDC STX SNDK` / `ASML AMAT LRCX KLAC` / `ANET DELL CRWV VRT` / `MSFT GOOGL AMZN META ORCL IBM PLTR SNOW` / `AAPL TSLA CRM`
-
-改 `ib_research_fetcher.py` 里的 `HOT_SYMBOLS` 一处即可全局生效。
-
-## 快速开始
-
-```bash
-pip3 install -r requirements.txt
-cp .env.example .env          # 仅 FINNHUB_API_KEY 必需，其余缺失自动降级
-python3 ib_research_fetcher.py
-python3 ib_research_fetcher.py --fast   # 读 AV 缓存，适合高频 cron
-python3 ib_research_server.py           # http://localhost:8081
-python3 ib_research_health.py
-python3 -m unittest test_ib_research_geo test_institution_intelligence
+```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+cp .env.example .env
 ```
 
-定时任务见 `ib_research_cron_runner.py`（带锁、日志、异常告警）。每次采集成功且质量检查通过后，`publish_cloudflare.py` 会在后台导出并发布新的 Cloudflare 静态快照。
+在同一终端指定本次采集的配置和输出目录。示例关闭采集成功后的自动云端发布，结果留在本机。
 
-## 上线
-
-本仓库是代码源头；`~/.openclaw/workspace` 是采集运行环境（数据目录和 `.env` 留在那边，不被覆盖）。公网请求不再依赖本机 Flask/Tunnel 在线。
-
-```bash
-bash deploy.sh    # 同步代码 → 校验/单测 → 本机预览冒烟 → 发布 Cloudflare
-python3 publish_cloudflare.py  # 仅重新导出并发布当前只读快照
+```sh
+export IB_RESEARCH_ENV="$PWD/.env"
+export IB_RESEARCH_CACHE_DIR="$PWD/data/ib_research"
+export IB_RESEARCH_CLOUDFLARE_PUBLISH=0
+python ib_research_fetcher.py
 ```
 
-公网 `https://fresearch.cc.cd/*` 由 Worker route 直接命中静态资产；`127.0.0.1:8081` 仅保留为本机预览和手动刷新入口。Cloudflare 部署是不可变版本，发布失败时线上继续提供上一版内容。
+报告按日写入 `data/ib_research/report_YYYY-MM-DD.json`。写入后采集器会尝试启动预览，打开 [本机首页](http://127.0.0.1:8081/) 即可查看。如果预览未启动，在同一环境运行 `python ib_research_server.py`。缺少数据源或摘要生成失败时，查看采集输出中的质量状态和报告时间。
 
-## 代码结构
+| 日常操作 | 命令 |
+| --- | --- |
+| 在已有报告上增量补充新事件 | `python ib_research_fetcher.py --fast` |
+| 检查新鲜度、完整性和历史连续性 | `python ib_research_health.py` |
+| 运行仓库测试 | `python -m unittest discover -s . -p 'test_*.py'` |
 
-| 文件 | 职责 |
-|------|------|
-| `ib_research_fetcher.py` | 抓取 + LLM 摘要，产出 `report.json` |
-| `ib_research_server.py` | Flask 服务与首页；首屏一页评级行 + JSON 岛 |
-| `ib_research_geo.py` | GEO 子页、sitemap、robots、JSON-LD、llms.txt |
-| `design_system.py` | 主题 token、基础样式、公共组件 CSS |
-| `institution_intelligence.py` | 按机构聚合方向一致率与按方向计的超额收益 |
-| `collectors/yahoo_provider.py` | Yahoo 评级回填 |
-| `llm_fallback.py` | Kimi 失败时切 Qwen |
-| `ib_research_cron_runner.py` | 定时抓取入口 |
-| `ib_research_health.py` | 数据新鲜度 / 质量检查 |
-| `ib_research_seo_monitor.py` | 公网收录巡检 |
-| `export_static_site.py` | 把 Flask 只读页面、JSON API 与图标导出为静态站点 |
-| `publish_cloudflare.py` | 带锁构建并通过 Wrangler 发布 Cloudflare 快照 |
-| `wrangler.jsonc` | Workers Static Assets、预览地址与生产 route 配置 |
-| `deploy.sh` | 同步到 workspace 并重启服务 |
-| `test_ib_research_geo.py` / `test_institution_intelligence.py` | 页面与机构分析单测 |
+### 配置与覆盖范围
 
-## 环境变量
+- `FINNHUB_API_KEY` 用于 Finnhub 数据。未配置时采集器会跳过相应调用。`ALPHA_VANTAGE_API_KEY` 用于一致预期，查询结果可缓存。`TWELVEDATA_API_KEY`、`MARKETDATA_API_KEY` 用于补充行情。
+- `KIMI_API_KEY`、`LLM_QWEN_API_KEY` 分别用于摘要主通道和可选回退。可用的摘要、报价和历史窗口取决于服务响应、授权与已有数据。上游需要代理时按运行环境设置 `HTTPS_PROXY`。
+- `IB_RESEARCH_REFRESH_TOKEN` 用于手动刷新端点，`IB_RESEARCH_PUBLIC_ORIGIN` 设置对外页面的规范域名。配置项见 [环境样例](.env.example)。
 
-| Key | 说明 |
-|-----|------|
-| `FINNHUB_API_KEY` | Finnhub 评级与新闻（必需） |
-| `ALPHA_VANTAGE_API_KEY` | 一致目标价（每日 25 次免费额度，按天缓存） |
-| `TWELVEDATA_API_KEY` / `MARKETDATA_API_KEY` | 行情补充 |
-| `KIMI_API_KEY` | Kimi LLM 摘要 |
-| `LLM_QWEN_API_KEY` | Qwen 兜底（可选） |
-| `IB_RESEARCH_REFRESH_TOKEN` | 保护 `/refresh` 端点（可选） |
-| `IB_RESEARCH_CACHE_DIR` | 数据目录（默认 `./data/ib_research`） |
-| `IB_RESEARCH_PUBLIC_ORIGIN` | 对外 canonical 域名（默认 `https://fresearch.cc.cd`） |
-| `HTTPS_PROXY` | 境外源走本地代理（例 `http://127.0.0.1:1082`） |
+## 本机预览、静态快照与收录
 
-## 数据来源说明
+本机 Flask 提供研究页面、`/api/ib-research` 和手动刷新。公开站点使用 Cloudflare Workers Static Assets，读者看到的是最近发布的快照。代码推送和站点发布是两个独立步骤。
 
-页面上的评级、目标价和研报观点均来自公开可访问的结构化数据、标题或摘要；LLM 只做归纳，无法交叉验证的数字不会作为事实展示。市场验证采用日期级事件与复权价格，同日多家机构发声会标记混杂，样本不足会降低置信度。
+| 入口 | 用途 |
+| --- | --- |
+| [定时采集](ib_research_cron_runner.py) / [健康检查](ib_research_health.py) | 检查本轮报告、数据质量和新鲜度，记录运行结果。快速采集可以复用最近的报告。 |
+| [行情与评级回填](collectors/yahoo_provider.py) / [机构指标](institution_intelligence.py) | 对照上游数据、事件窗口和方向统计的具体实现。 |
+| [页面生成](ib_research_geo.py) / [共享样式](design_system.py) | 股票、机构、研究框架与披露页共用主题。旧 `/learn/` 和 `/compare/` 链接由路由重定向。 |
+| [导出](export_static_site.py) / [发布](publish_cloudflare.py) | `python export_static_site.py` 生成 `cloudflare_dist/`。部署到自己的站点前，核对 [Wrangler 配置](wrangler.jsonc)、域名和发布凭据。已有环境的同步、测试、预览检查与发布流程见 [部署脚本](deploy.sh)，其中路径需按部署环境调整。 |
 
-「市场确认 / 未确认」只描述公开观点与后续价格之间的关系，不能证明机构持仓或交易台行为，也不能据此断言「唱多出货」或「唱空抄底」。免费方案实测不可用的来源（Barron's 401、Seeking Alpha PerimeterX 403、TipRanks 403 等）不接入。
+`/sitemap.xml` 只纳入有内容的股票和机构等页面。`/robots.txt` 区分搜索抓取与训练抓取，并限制 `/api/`。`/llms.txt` 提供站点导航。首页、文章和关于页使用对应的 JSON-LD 类型，FAQ 至少有两组问答才输出；分享图使用 `/og-image.png`。`python ib_research_seo_monitor.py` 可检查公开站点的收录相关入口。
 
-## License
-
-MIT
+软件采用 [MIT 许可证](LICENSE)。
